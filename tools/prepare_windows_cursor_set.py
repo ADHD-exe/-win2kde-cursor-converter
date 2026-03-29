@@ -512,22 +512,42 @@ def choose_slot_assignments(
         used_paths.add(path)
         diagnostics["chosen_by_inf"][slot_key] = str(path)
 
-    for slot in SLOT_DEFS:
-        slot_key = slot["key"]
+    slot_order = {slot["key"]: index for index, slot in enumerate(SLOT_DEFS)}
+    ranked_pairs: list[tuple[tuple[int, int, int, int, str, str], str, dict]] = []
+    for slot_key, candidates in heuristic_candidates.items():
         if slot_key in chosen:
             continue
-        for candidate in heuristic_candidates[slot_key]:
+        for candidate in candidates:
             candidate_path = Path(candidate["path"]).resolve()
-            if candidate_path in used_paths:
-                continue
-            chosen[slot_key] = candidate_path
-            used_paths.add(candidate_path)
-            diagnostics["chosen_by_heuristic"][slot_key] = {
-                "path": str(candidate_path),
-                "score": candidate["score"],
-                "reason": candidate["reason"],
-            }
-            break
+            ranked_pairs.append(
+                (
+                    (
+                        -int(candidate["score"]),
+                        int(candidate.get("low_priority_hits", 0)),
+                        int(candidate.get("depth", 0)),
+                        slot_order[slot_key],
+                        str(candidate_path).lower(),
+                        candidate.get("reason", ""),
+                    ),
+                    slot_key,
+                    candidate,
+                )
+            )
+
+    ranked_pairs.sort(key=lambda item: item[0])
+    for _sort_key, slot_key, candidate in ranked_pairs:
+        if slot_key in chosen:
+            continue
+        candidate_path = Path(candidate["path"]).resolve()
+        if candidate_path in used_paths:
+            continue
+        chosen[slot_key] = candidate_path
+        used_paths.add(candidate_path)
+        diagnostics["chosen_by_heuristic"][slot_key] = {
+            "path": str(candidate_path),
+            "score": candidate["score"],
+            "reason": candidate["reason"],
+        }
 
     fallback_pairs = [
         ("hand", "link_alias"),
