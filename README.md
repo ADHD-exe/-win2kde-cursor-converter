@@ -1,4 +1,4 @@
-# win2kde-cursor-converter
+# CursorForge
 
 Convert Windows `.ani` / `.cur` cursor packs into Linux Xcursor themes with a staged GUI workflow.
 
