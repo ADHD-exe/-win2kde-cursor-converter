@@ -20,6 +20,7 @@ from xcursor_builder import (
     HASH_ALIASES,
     build_cursor_file,
     ensure_clean_dir,
+    file_cache_token,
     prepare_scaled_frames,
     write_config,
     write_theme_metadata,
@@ -37,8 +38,11 @@ MAPPING_FORMAT_VERSION = 2
 
 
 def unique_extract_dir(base: Path, source_path: Path) -> Path:
-    digest = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()[:8]
-    return base / f"{sanitize_path_component(source_path.stem)}-{digest}"
+    resolved_source = source_path.expanduser().resolve()
+    digest = hashlib.sha256(
+        f"{resolved_source}::{file_cache_token(resolved_source)}".encode("utf-8")
+    ).hexdigest()[:10]
+    return base / f"{sanitize_path_component(resolved_source.stem)}-{digest}"
 
 
 def parse_size_list(raw_sizes: str | list[int] | None) -> list[int]:
@@ -230,7 +234,9 @@ def localize_metadata_frames(metadata: dict, localized_dir: Path) -> dict:
     for sequence_index, frame in enumerate(metadata.get("frames", [])):
         source_png = Path(frame["png"]).expanduser().resolve()
         suffix = source_png.suffix or ".png"
-        digest = hashlib.sha256(str(source_png).encode("utf-8")).hexdigest()[:8]
+        digest = hashlib.sha256(
+            f"{source_png}::{file_cache_token(source_png)}".encode("utf-8")
+        ).hexdigest()[:10]
         frame_index = int(frame.get("frame_index", sequence_index))
         entry_index = int(frame.get("entry_index", 1) or 1)
         target_name = (

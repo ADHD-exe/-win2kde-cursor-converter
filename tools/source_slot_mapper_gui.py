@@ -24,10 +24,11 @@ from build_from_slot_mapping import (
     load_source_metadata,
     prepare_output_preview_metadata,
 )
+from xcursor_builder import choose_best_entry, file_cache_token
 from prepare_windows_cursor_set import analyze_cursor_pack, prepare_windows_cursor_set
 from slot_definitions import (
     BUILD_PRESETS,
-    BUILD_PRESET_BY_KEY,
+    BUILD_PRESET_LABELS,
     DEFAULT_CURSOR_SIZES,
     DEFAULT_SCALE_FILTER,
     SCALE_FILTER_CHOICES,
@@ -36,6 +37,7 @@ from slot_definitions import (
     describe_build_preset,
     format_cursor_sizes,
     normalize_cursor_sizes,
+    resolve_build_preset,
     score_slot_match,
 )
 from windows_cursor_tool import sanitize_path_component
@@ -238,7 +240,7 @@ def find_image_tool() -> str:
 def render_preview_thumbnail(source_png: Path, preview_root: Path, box_size: int) -> Path:
     preview_root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(
-        f"{source_png.resolve()}::{source_png.stat().st_mtime_ns}::{box_size}".encode("utf-8")
+        f"{source_png.resolve()}::{file_cache_token(source_png)}::{box_size}".encode("utf-8")
     ).hexdigest()[:12]
     preview_png = preview_root / f"{sanitize_path_component(source_png.stem)}_{digest}_{box_size}.png"
     if preview_png.exists():
@@ -323,18 +325,7 @@ def summarize_metadata(source_path: Path, metadata: dict) -> dict:
     }
 
 
-def preview_entry_sort_key(entry: dict) -> tuple[int, int, int, int]:
-    colors = int(entry.get("colors", 0) or 0)
-    colors = 1_000_000 if colors == 0 else colors
-    return (
-        max(int(entry["width"]), int(entry["height"])),
-        int(entry["width"]) * int(entry["height"]),
-        int(entry.get("image_size", 0) or 0),
-        colors,
-    )
-
-
-def frames_from_source_metadata(metadata: dict) -> list[dict]:
+def frames_from_source_metadata(metadata: dict, target_size: int) -> list[dict]:
     frames = []
     for frame_index, frame in enumerate(metadata.get("frames", [])):
         entries = frame.get("entries", [])
@@ -342,7 +333,7 @@ def frames_from_source_metadata(metadata: dict) -> list[dict]:
             entries = [frame]
         if not entries:
             continue
-        entry = max(entries, key=preview_entry_sort_key)
+        entry = choose_best_entry(entries, max(1, int(target_size)))
         frames.append(
             {
                 "png": str(Path(entry["png"]).expanduser().resolve()),
@@ -422,6 +413,59 @@ def infer_slot_warnings(slot_key: str, summary: dict, target_sizes: list[int], p
     return list(dict.fromkeys(warnings))
 
 
+def build_slot_card_subtitle(summary: dict) -> str:
+    animated = "ANI" if summary.get("is_animated") else "Static"
+    source_type = str(summary.get("source_type", "unknown")).upper()
+    size_summary = summary.get("size_summary", "--")
+    hotspot_summary = summary.get("hotspot_summary", "--")
+    return f"{animated} | {source_type} | {size_summary} | hotspot {hotspot_summary}"
+
+
+def inspect_animation_behavior(frames: list[dict]) -> dict:
+    if not frames:
+        return {
+            "stats": "No frame timing available",
+            "timeline": "",
+            "warnings": [],
+        }
+
+    delays = [max(1, int(frame.get("delay_ms", 50))) for frame in frames]
+    total_ms = sum(delays)
+    min_delay = min(delays)
+    max_delay = max(delays)
+    avg_delay = total_ms / len(delays)
+    if len(frames) <= 1:
+        pacing = "static"
+    elif avg_delay <= 45:
+        pacing = "fast"
+    elif avg_delay <= 90:
+        pacing = "balanced"
+    else:
+        pacing = "slow"
+
+    warnings = []
+    if len(frames) > 1 and min_delay < 25:
+        warnings.append("contains very fast frames and may feel flickery")
+    if len(frames) > 1 and total_ms < 350:
+        warnings.append("animation loop is very short and may feel busy")
+    if len(frames) > 1 and max_delay >= max(4 * min_delay, min_delay + 120):
+        warnings.append("frame delays vary sharply across the loop")
+    if len(frames) >= 24:
+        warnings.append("long animation sequence; inspect pacing before export")
+    if any(int(frame.get("width", 0)) != int(frame.get("height", 0)) for frame in frames):
+        warnings.append("contains non-square frames; verify the Linux output preview")
+
+    timeline = " | ".join(f"{index + 1}:{delay}ms" for index, delay in enumerate(delays[:8]))
+    if len(delays) > 8:
+        timeline += " | ..."
+
+    return {
+        "stats": f"Pacing: {pacing} | delay range {min_delay}-{max_delay}ms | loop {format_duration_ms(total_ms)}",
+        "timeline": f"Frame strip: {timeline}",
+        "warnings": warnings,
+    }
+
+
 class AnimationPreviewPanel(ttk.LabelFrame):
     def __init__(self, master: tk.Widget, title: str, canvas_size: int, palette: dict[str, str]):
         super().__init__(master, text=title, padding=8)
@@ -479,6 +523,22 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             pady=(2, 0),
         )
 
+        self.inspection_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.inspection_var, justify="left", wraplength=canvas_size + 40, style="Muted.TLabel").grid(
+            row=4,
+            column=0,
+            sticky="w",
+            pady=(2, 0),
+        )
+
+        self.warning_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.warning_var, justify="left", wraplength=canvas_size + 40, style="Warning.TLabel").grid(
+            row=5,
+            column=0,
+            sticky="w",
+            pady=(2, 0),
+        )
+
         self.clear("No preview loaded")
 
     def destroy(self) -> None:
@@ -509,8 +569,18 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         )
         self.summary_var.set(reason)
         self.frame_info_var.set("")
+        self.inspection_var.set("")
+        self.warning_var.set("")
 
-    def set_frames(self, frames: list[dict], images: list[tk.PhotoImage], summary: str, frame_info: str) -> None:
+    def set_frames(
+        self,
+        frames: list[dict],
+        images: list[tk.PhotoImage],
+        summary: str,
+        frame_info: str,
+        inspection_text: str = "",
+        warning_text: str = "",
+    ) -> None:
         self._cancel_after()
         if not frames or not images:
             self.clear("No preview available")
@@ -521,6 +591,8 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         self.running = len(frames) > 1
         self.summary_var.set(summary)
         self.frame_info_var.set(frame_info)
+        self.inspection_var.set(inspection_text)
+        self.warning_var.set(warning_text)
         self._draw_current_frame()
         if self.running:
             self._schedule_next_frame()
@@ -712,10 +784,11 @@ class SlotCard(tk.Frame):
 
         quality_label = quality["label"] if quality else "--"
         self.file_label.configure(text=f"{Path(path).name}   [{quality_label}]")
-        self.badge_label.configure(text=badges_for_summary(summary))
+        self.badge_label.configure(text=build_slot_card_subtitle(summary))
         self.path_label.configure(text=compact_path(path))
         warnings = quality["warnings"] if quality else []
-        self.warning_label.configure(text=warnings[0] if warnings else "")
+        quality_reason = quality["reason"] if quality else ""
+        self.warning_label.configure(text=warnings[0] if warnings else quality_reason)
 
 
 def draw_slot_glyph(canvas: tk.Canvas, slot_key: str, palette: dict[str, str], bg: str = "white") -> None:
@@ -821,7 +894,7 @@ class MappingApp:
         self.status_var = tk.StringVar(value="Ready")
         self.target_sizes = list(DEFAULT_CURSOR_SIZES)
         self.target_sizes_var = tk.StringVar(value=format_cursor_sizes(self.target_sizes))
-        self.build_preset_var = tk.StringVar(value="hidpi-kde")
+        self.build_preset_var = tk.StringVar(value=resolve_build_preset("hidpi-kde")["label"])
         self.preview_nominal_size_var = tk.StringVar(value=str(self._default_preview_size(self.target_sizes)))
         self.preset_description_var = tk.StringVar(value=describe_build_preset(self.build_preset_var.get()))
         self.overall_quality_var = tk.StringVar(value="Overall quality forecast: --")
@@ -1016,7 +1089,7 @@ class MappingApp:
 
     def _build_analysis_tab(self) -> None:
         self.analysis_tab.columnconfigure(0, weight=1)
-        self.analysis_tab.rowconfigure(2, weight=1)
+        self.analysis_tab.rowconfigure(3, weight=1)
 
         controls = ttk.LabelFrame(self.analysis_tab, text="Stage 1: Analyze The Source Pack", padding=10)
         controls.grid(row=0, column=0, sticky="ew")
@@ -1039,8 +1112,43 @@ class MappingApp:
             justify="left",
         ).grid(row=1, column=1, columnspan=4, sticky="w", pady=(12, 3))
 
+        snapshot = ttk.Frame(self.analysis_tab)
+        snapshot.grid(row=1, column=0, sticky="ew", pady=(10, 10))
+        for column in range(4):
+            snapshot.columnconfigure(column, weight=1)
+
+        self.analysis_total_value_var = tk.StringVar(value="--")
+        self.analysis_total_note_var = tk.StringVar(value="Source files")
+        self.analysis_animation_value_var = tk.StringVar(value="--")
+        self.analysis_animation_note_var = tk.StringVar(value="Animated sources")
+        self.analysis_hidpi_value_var = tk.StringVar(value="--")
+        self.analysis_hidpi_note_var = tk.StringVar(value="HiDPI potential")
+        self.analysis_attention_value_var = tk.StringVar(value="--")
+        self.analysis_attention_note_var = tk.StringVar(value="Warnings and ambiguity")
+
+        metric_specs = [
+            ("Source Files", self.analysis_total_value_var, self.analysis_total_note_var),
+            ("Animated", self.analysis_animation_value_var, self.analysis_animation_note_var),
+            ("HiDPI", self.analysis_hidpi_value_var, self.analysis_hidpi_note_var),
+            ("Attention", self.analysis_attention_value_var, self.analysis_attention_note_var),
+        ]
+        for column, (title, value_var, note_var) in enumerate(metric_specs):
+            card = ttk.LabelFrame(snapshot, text=title, padding=10)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0))
+            ttk.Label(card, textvariable=value_var, font=("", 14, "bold"), style="Heading.TLabel").grid(
+                row=0,
+                column=0,
+                sticky="w",
+            )
+            ttk.Label(card, textvariable=note_var, style="Muted.TLabel", wraplength=240, justify="left").grid(
+                row=1,
+                column=0,
+                sticky="w",
+                pady=(4, 0),
+            )
+
         overview = ttk.Frame(self.analysis_tab)
-        overview.grid(row=1, column=0, sticky="ew", pady=(10, 10))
+        overview.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         overview.columnconfigure(0, weight=1)
         overview.columnconfigure(1, weight=1)
 
@@ -1078,7 +1186,7 @@ class MappingApp:
         set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
 
         assets_frame = ttk.LabelFrame(self.analysis_tab, text="Detected Source Assets", padding=10)
-        assets_frame.grid(row=2, column=0, sticky="nsew")
+        assets_frame.grid(row=3, column=0, sticky="nsew")
         assets_frame.columnconfigure(0, weight=1)
         assets_frame.rowconfigure(0, weight=1)
 
@@ -1119,7 +1227,7 @@ class MappingApp:
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(4, weight=1)
+        right.rowconfigure(3, weight=1)
         paned.add(left, weight=3)
         paned.add(right, weight=5)
 
@@ -1279,7 +1387,7 @@ class MappingApp:
         self.preset_combo = ttk.Combobox(
             top,
             textvariable=self.build_preset_var,
-            values=[preset["key"] for preset in BUILD_PRESETS],
+            values=BUILD_PRESET_LABELS,
             state="readonly",
             width=18,
         )
@@ -1358,17 +1466,19 @@ class MappingApp:
         self._update_preview_size_choices()
 
     def _update_preset_description(self) -> None:
-        preset_key = self.build_preset_var.get().strip()
-        if preset_key in BUILD_PRESET_BY_KEY:
-            self.preset_description_var.set(describe_build_preset(preset_key))
+        preset_value = self.build_preset_var.get().strip()
+        try:
+            self.preset_description_var.set(describe_build_preset(preset_value))
+        except KeyError:
+            pass
 
     def _sync_preset_from_settings(self) -> None:
         sizes, _error = self.try_target_sizes()
         current_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
         for preset in BUILD_PRESETS:
             if preset["target_sizes"] == sizes and preset["scale_filter"] == current_filter:
-                if self.build_preset_var.get() != preset["key"]:
-                    self.build_preset_var.set(preset["key"])
+                if self.build_preset_var.get() != preset["label"]:
+                    self.build_preset_var.set(preset["label"])
                 return
 
     def set_status(self, message: str) -> None:
@@ -1381,7 +1491,7 @@ class MappingApp:
 
     def preview_photo(self, png_path: Path, box_size: int) -> tk.PhotoImage:
         resolved = png_path.expanduser().resolve()
-        key = f"{resolved}::{resolved.stat().st_mtime_ns}::{box_size}"
+        key = f"{resolved}::{file_cache_token(resolved)}::{box_size}"
         if key in self.preview_photo_cache:
             return self.preview_photo_cache[key]
         preview_png = render_preview_thumbnail(resolved, self.current_preview_root() / "_thumbs", box_size)
@@ -1392,7 +1502,7 @@ class MappingApp:
     def _source_metadata_cache_key(self, source_path: Path) -> str:
         resolved = source_path.expanduser().resolve()
         preview_root = self.current_preview_root()
-        return f"{resolved}::{resolved.stat().st_mtime_ns}::{preview_root}"
+        return f"{resolved}::{file_cache_token(resolved)}::{preview_root}"
 
     def ensure_source_metadata(self, source_path: Path) -> dict:
         cache_key = self._source_metadata_cache_key(source_path)
@@ -1427,7 +1537,7 @@ class MappingApp:
         filter_name = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
         resolved = source_path.expanduser().resolve()
         cache_key = (
-            f"{resolved}::{resolved.stat().st_mtime_ns}::{format_cursor_sizes(sizes)}::"
+            f"{resolved}::{file_cache_token(resolved)}::{format_cursor_sizes(sizes)}::"
             f"{filter_name}::{preview_nominal_size or self.preview_nominal_size_var.get()}::{self.current_preview_root()}"
         )
         if cache_key in self.output_preview_cache:
@@ -1458,6 +1568,16 @@ class MappingApp:
             if self.target_sizes_var.get().strip() != normalized_text:
                 self.target_sizes_var.set(normalized_text)
         return sizes
+
+    def current_preview_nominal_size(self) -> int:
+        sizes = self.try_target_sizes()[0]
+        raw_value = self.preview_nominal_size_var.get().strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                pass
+        return self._default_preview_size(sizes)
 
     def _default_preview_size(self, sizes: list[int]) -> int:
         return min(sizes, key=lambda size: (abs(size - 32), size))
@@ -1522,12 +1642,23 @@ class MappingApp:
             self.analysis_hidpi_var.set("HiDPI: --")
             self.analysis_sizes_var.set("Largest native sizes: --")
             self.analysis_animated_var.set("Animated sources: --")
+            self.analysis_total_value_var.set("--")
+            self.analysis_total_note_var.set("Source files")
+            self.analysis_animation_value_var.set("--")
+            self.analysis_animation_note_var.set("Animated sources")
+            self.analysis_hidpi_value_var.set("--")
+            self.analysis_hidpi_note_var.set("HiDPI potential")
+            self.analysis_attention_value_var.set("--")
+            self.analysis_attention_note_var.set("Warnings and ambiguity")
             set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
             for item in self.analysis_asset_tree.get_children():
                 self.analysis_asset_tree.delete(item)
             return
 
         counts = analysis["counts"]
+        warning_count = len(analysis.get("warnings", []))
+        ambiguous_count = len(analysis.get("ambiguous_candidates", {}))
+        duplicate_count = len(analysis.get("duplicate_artifacts", []))
         self.analysis_counts_var.set(
             f"Files: {counts['total']} total | {counts['cur']} .cur | {counts['ani']} .ani | {counts['png']} .png"
         )
@@ -1549,6 +1680,19 @@ class MappingApp:
             + (", ".join(str(size) for size in analysis["largest_native_sizes_found"]) or "--")
         )
         self.analysis_animated_var.set(f"Animated sources detected: {len(analysis['animated_sources'])}")
+        self.analysis_total_value_var.set(str(counts["total"]))
+        self.analysis_total_note_var.set(f"{counts['cur']} CUR | {counts['ani']} ANI | {counts['png']} PNG")
+        self.analysis_animation_value_var.set(str(len(analysis["animated_sources"])))
+        self.analysis_animation_note_var.set(
+            "Real animation preview available" if analysis["animated_sources"] else "Static-only or undetected"
+        )
+        self.analysis_hidpi_value_var.set(str(analysis["hidpi_potential"]["rating"]).upper())
+        largest_sizes = ", ".join(str(size) for size in analysis["largest_native_sizes_found"][:4]) or "--"
+        self.analysis_hidpi_note_var.set(f"Top native sizes: {largest_sizes}")
+        self.analysis_attention_value_var.set(str(warning_count + ambiguous_count))
+        self.analysis_attention_note_var.set(
+            f"{warning_count} warning(s), {ambiguous_count} ambiguous slot(s), {duplicate_count} duplicate/temp artifact(s)"
+        )
 
         warning_lines = []
         if analysis.get("warnings"):
@@ -1825,7 +1969,10 @@ class MappingApp:
             if path:
                 try:
                     summary = self.ensure_summary(Path(path))
-                    source_frames = frames_from_source_metadata(self.ensure_source_metadata(Path(path)))
+                    source_frames = frames_from_source_metadata(
+                        self.ensure_source_metadata(Path(path)),
+                        self.current_preview_nominal_size(),
+                    )
                     if source_frames:
                         card.preview_image = self.preview_photo(Path(source_frames[0]["png"]), CARD_PREVIEW_SIZE)
                     quality = self._slot_quality(slot["key"], path)
@@ -1879,23 +2026,33 @@ class MappingApp:
 
     def _load_source_preview(self, source_path: Path) -> None:
         metadata = self.ensure_source_metadata(source_path)
-        frames = frames_from_source_metadata(metadata)
+        preview_size = self.current_preview_nominal_size()
+        frames = frames_from_source_metadata(metadata, preview_size)
         if not frames:
             self.source_preview_panel.clear("No extracted frames available")
             return
         images = [self.preview_photo(Path(frame["png"]), PLAYER_PREVIEW_SIZE) for frame in frames]
+        inspection = inspect_animation_behavior(frames)
         summary = (
             f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))} total | "
-            f"using representative native entries"
+            f"using build-consistent native entries for {preview_size}px"
         )
         frame_info = f"Actual source timing preserved. First frame nominal size: {frames[0]['nominal_size']}px."
-        self.source_preview_panel.set_frames(frames, images, summary, frame_info)
+        self.source_preview_panel.set_frames(
+            frames,
+            images,
+            summary,
+            frame_info,
+            inspection_text=f"{inspection['stats']} | {inspection['timeline']}",
+            warning_text="; ".join(inspection["warnings"][:2]),
+        )
 
     def _load_output_preview(self, source_path: Path) -> None:
-        preview_size = int(self.preview_nominal_size_var.get())
+        preview_size = self.current_preview_nominal_size()
         preview = self.ensure_output_preview(source_path, preview_size)
         frames = preview["frames"]
         images = [self.preview_photo(Path(frame["png"]), PLAYER_PREVIEW_SIZE) for frame in frames]
+        inspection = inspect_animation_behavior(frames)
         total_ms = sum(int(frame.get("delay_ms", 50)) for frame in frames)
         if frames:
             first = frames[0]
@@ -1906,7 +2063,14 @@ class MappingApp:
         else:
             frame_info = "No predicted frames available"
         summary = f"{len(frames)} frame(s) | {format_duration_ms(total_ms)} total | built path preview"
-        self.output_preview_panel.set_frames(frames, images, summary, frame_info)
+        self.output_preview_panel.set_frames(
+            frames,
+            images,
+            summary,
+            frame_info,
+            inspection_text=f"{inspection['stats']} | {inspection['timeline']}",
+            warning_text="; ".join(inspection["warnings"][:2]),
+        )
 
     def _populate_candidate_tree(self) -> None:
         for item in self.candidate_tree.get_children():
@@ -1940,6 +2104,12 @@ class MappingApp:
             if first != "__none__":
                 self.candidate_tree.selection_set(first)
 
+    def _candidate_lookup(self) -> dict[str, dict]:
+        if self.pack_analysis is None:
+            return {}
+        candidates = self.pack_analysis.get("slot_candidates", {}).get(self.selected_slot_key, [])
+        return {candidate["path"]: candidate for candidate in candidates}
+
     def _refresh_candidate_detail(self) -> None:
         selection = self.candidate_tree.selection()
         if not selection or selection[0] == "__none__":
@@ -1951,20 +2121,40 @@ class MappingApp:
         candidate_path = selection[0]
         self.selected_candidate_path = candidate_path
         try:
+            candidate = self._candidate_lookup().get(candidate_path, {})
             summary = self.ensure_summary(Path(candidate_path))
             quality = self._slot_quality(self.selected_slot_key, candidate_path)
+            reason = candidate.get("reason", "Manual source selection")
+            rank = candidate.get("rank")
+            rank_text = f"Rank #{rank}" if rank is not None else "Manual source"
+            relative_path = summary.get("relative_path", compact_path(candidate_path, max_len=82))
             self.candidate_summary_var.set(
-                f"{Path(candidate_path).name} | {badges_for_summary(summary)} | quality {quality['label']}"
+                f"{Path(candidate_path).name} | {rank_text} for {SLOT_BY_KEY[self.selected_slot_key]['label']}\n"
+                f"{badges_for_summary(summary)} | quality {quality['label']}\n"
+                f"Reason: {reason}\n"
+                f"Source location: {relative_path}"
             )
-            self.candidate_warning_var.set("; ".join(quality["warnings"][:3]) or "No immediate candidate warnings.")
+            warning_lines = []
+            warning_lines.extend(candidate.get("warnings", []))
+            if candidate.get("low_priority_hits"):
+                warning_lines.append("stored under a lower-priority/generated folder")
+            if candidate.get("depth", 0):
+                warning_lines.append(f"nested {candidate['depth']} folder level(s) below the pack root")
+            warning_lines.extend(quality["warnings"])
+            self.candidate_warning_var.set(
+                "; ".join(list(dict.fromkeys(warning_lines))[:4]) or "No immediate candidate warnings."
+            )
             metadata = self.ensure_source_metadata(Path(candidate_path))
-            frames = frames_from_source_metadata(metadata)
+            frames = frames_from_source_metadata(metadata, self.current_preview_nominal_size())
             images = [self.preview_photo(Path(frame["png"]), CANDIDATE_PREVIEW_SIZE) for frame in frames]
+            inspection = inspect_animation_behavior(frames)
             self.candidate_preview_panel.set_frames(
                 frames,
                 images,
                 f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))}",
                 f"Candidate path: {compact_path(candidate_path, max_len=82)}",
+                inspection_text=f"{inspection['stats']} | {inspection['timeline']}",
+                warning_text="; ".join(inspection["warnings"][:2]),
             )
         except Exception as exc:  # noqa: BLE001
             self.candidate_summary_var.set(Path(candidate_path).name)
@@ -2024,8 +2214,15 @@ class MappingApp:
 
         set_readonly_text(self.build_warning_text, "\n".join(dict.fromkeys(warning_lines)) or "No major warnings.")
 
+        try:
+            preset = resolve_build_preset(self.build_preset_var.get().strip())
+            preset_label = preset["label"]
+        except KeyError:
+            preset_label = self.build_preset_var.get().strip() or "--"
+
         build_summary_lines = [
             f"Theme name: {self.theme_name_var.get().strip() or 'Custom-cursor'}",
+            f"Build preset: {preset_label}",
             f"Output root: {self.work_root_var.get().strip() or DEFAULT_WORK_ROOT}",
             f"Target sizes: {format_cursor_sizes(sizes)}",
             f"Scale filter: {self.scale_filter_var.get()}",
@@ -2066,10 +2263,11 @@ class MappingApp:
         self._refresh_all_views()
 
     def apply_selected_preset(self) -> None:
-        preset = BUILD_PRESET_BY_KEY[self.build_preset_var.get()]
+        preset = resolve_build_preset(self.build_preset_var.get())
         self.target_sizes_var.set(format_cursor_sizes(preset["target_sizes"]))
         self.scale_filter_var.set(preset["scale_filter"])
-        self.preset_description_var.set(describe_build_preset(preset["key"]))
+        self.build_preset_var.set(preset["label"])
+        self.preset_description_var.set(describe_build_preset(preset["label"]))
         self.preview_nominal_size_var.set(str(self._default_preview_size(preset["target_sizes"])))
         self.set_status(f"Applied preset: {preset['label']}")
         self._refresh_all_views()

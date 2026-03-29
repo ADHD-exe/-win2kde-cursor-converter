@@ -27,6 +27,7 @@ The project now has both:
 
 Recent product-level upgrades:
 - pack analysis before slot mapping
+- at-a-glance analysis snapshot cards for source count, animation coverage, HiDPI potential, and attention items
 - visual slot cards instead of a raw path table
 - real animated source previews
 - predicted Linux output previews driven by current build settings
@@ -85,6 +86,12 @@ The GUI now surfaces pack-level diagnostics before mapping:
 - ambiguous slot candidates
 - low-quality pack warnings
 
+The analysis stage also includes snapshot cards so users can judge pack quality quickly before they start correcting slots:
+- total source file count
+- animated source coverage
+- HiDPI rating
+- combined attention signals from warnings, ambiguity, and duplicate artifacts
+
 Click `Auto-Fill From Pack` to run the prepare step and populate the slot review stage using the same analyzed source data.
 
 ### Stage 2: Slot Review / Correction
@@ -98,8 +105,9 @@ Each slot card shows:
 - animated or static badge
 - source type
 - native size summary
+- hotspot summary
 - quality forecast
-- first warning if the choice looks suspicious
+- first warning or scaling-quality reason if the choice looks suspicious
 
 Selecting a slot opens a richer review panel with:
 - selected source details
@@ -145,7 +153,7 @@ For animated sources, the review stage uses actual extracted metadata to preview
 
 Two preview paths are shown:
 - `Source Animation Preview`
-  This shows the source cursor behavior using representative native frames.
+  This shows the source cursor behavior using the same native-entry chooser the builder would use for the currently selected preview size.
 - `Predicted Linux Output Preview`
   This runs the current builder path with the selected sizes and scale filter, then previews the expected emitted Linux cursor frames.
 
@@ -156,23 +164,26 @@ The preview panels include:
 - speed multiplier
 - frame count
 - duration summary
+- timing profile summary
+- compact frame-strip timing readout
+- warnings for suspicious animation behavior such as very short loops, sharp timing jumps, or non-square frames
 
 Static assets still preview correctly.
 
 ## Build Presets
 
 The GUI includes named build presets:
-- `standard-linux`
-- `hidpi-kde`
-- `maximum-detail`
-- `pixel-glitch`
-- `smooth-aa`
+- `Standard Linux`
+- `HiDPI KDE`
+- `Maximum Detail`
+- `Pixel / Glitch`
+- `Smooth / Anti-aliased`
 
 Presets configure:
 - target sizes
 - scale filter
 
-The GUI keeps the preset label synchronized when the current settings match a known preset.
+The preset picker shows the user-facing labels while still syncing automatically when the current settings match a known preset.
 
 ## Validation And Quality Forecast
 
@@ -241,6 +252,8 @@ The GUI highlights non-square sources so users can inspect the predicted Linux p
 Malformed `.ani` files fail clearly instead of falling through to indexing errors.
 
 Examples:
+- mismatched declared ANI frame or step counts
+- empty `rate` / `seq ` chunks
 - out-of-bounds `seq ` references
 - invalid embedded icon references
 - malformed chunk lengths

@@ -341,6 +341,8 @@ SLOT_LABELS = [UNUSED] + [slot["label"] for slot in SLOT_DEFS]
 SLOT_BY_LABEL = {slot["label"]: slot for slot in SLOT_DEFS}
 SLOT_BY_KEY = {slot["key"]: slot for slot in SLOT_DEFS}
 BUILD_PRESET_BY_KEY = {preset["key"]: preset for preset in BUILD_PRESETS}
+BUILD_PRESET_BY_LABEL = {preset["label"]: preset for preset in BUILD_PRESETS}
+BUILD_PRESET_LABELS = [preset["label"] for preset in BUILD_PRESETS]
 
 
 def normalize_cursor_sizes(
@@ -367,8 +369,16 @@ def format_cursor_sizes(raw_sizes: str | list[int] | tuple[int, ...] | set[int] 
     return ", ".join(str(size) for size in normalize_cursor_sizes(raw_sizes))
 
 
-def describe_build_preset(preset_key: str) -> str:
-    preset = BUILD_PRESET_BY_KEY[preset_key]
+def resolve_build_preset(preset_value: str) -> dict:
+    if preset_value in BUILD_PRESET_BY_KEY:
+        return BUILD_PRESET_BY_KEY[preset_value]
+    if preset_value in BUILD_PRESET_BY_LABEL:
+        return BUILD_PRESET_BY_LABEL[preset_value]
+    raise KeyError(preset_value)
+
+
+def describe_build_preset(preset_value: str) -> str:
+    preset = resolve_build_preset(preset_value)
     return (
         f"{preset['label']}: {preset['description']} "
         f"Sizes {format_cursor_sizes(preset['target_sizes'])}; filter {preset['scale_filter']}."

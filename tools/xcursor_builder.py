@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -250,6 +251,24 @@ def find_identify_command() -> list[str]:
     raise RuntimeError("ImageMagick identify is required but was not found")
 
 
+@functools.lru_cache(maxsize=2048)
+def _file_content_digest(path_str: str, size: int, mtime_ns: int) -> str:
+    digest = hashlib.sha256()
+    digest.update(path_str.encode("utf-8"))
+    digest.update(str(size).encode("utf-8"))
+    digest.update(str(mtime_ns).encode("utf-8"))
+    with Path(path_str).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def file_cache_token(path: Path) -> str:
+    resolved = path.expanduser().resolve()
+    stats = resolved.stat()
+    return _file_content_digest(str(resolved), stats.st_size, stats.st_mtime_ns)
+
+
 def ensure_clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -408,15 +427,16 @@ def ensure_scaled_png(
     scale_filter: str,
 ) -> Path:
     generated_dir.mkdir(parents=True, exist_ok=True)
-    safe_stem = sanitize_path_component(source_png.stem)
-    digest = hashlib.sha256(str(source_png.expanduser().resolve()).encode("utf-8")).hexdigest()[:10]
-    output_path = generated_dir / f"{safe_stem}_{digest}_{scale_filter}_{target_size}.png"
+    resolved_source = source_png.expanduser().resolve()
+    safe_stem = sanitize_path_component(resolved_source.stem)
+    source_token = file_cache_token(resolved_source)
+    output_path = generated_dir / f"{safe_stem}_{source_token}_{scale_filter}_{target_size}.png"
     if output_path.exists():
         return output_path
 
     image_tool = find_image_tool()
     subprocess.run(
-        [image_tool, str(source_png), "-filter", scale_filter, "-resize", f"{target_size}x{target_size}", str(output_path)],
+        [image_tool, str(resolved_source), "-filter", scale_filter, "-resize", f"{target_size}x{target_size}", str(output_path)],
         check=True,
     )
     return output_path

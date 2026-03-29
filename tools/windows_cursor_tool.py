@@ -78,6 +78,69 @@ def _parse_u32_chunk(chunk_name: str, payload: bytes) -> list[int]:
     return list(struct.unpack(f"<{len(payload) // 4}I", payload))
 
 
+def _validate_ani_chunks(
+    anih: dict | None,
+    *,
+    has_rate_chunk: bool,
+    rates: list[int],
+    has_sequence_chunk: bool,
+    sequence: list[int],
+    icons: list[bytes],
+) -> tuple[int, list[int], list[int]]:
+    if anih is None:
+        raise ValueError("ANI file is missing an anih chunk")
+    if not icons:
+        raise ValueError("ANI file contains no icon frames")
+
+    declared_frames = int(anih.get("frames", 0) or 0)
+    if declared_frames > 0 and len(icons) < declared_frames:
+        raise ValueError(
+            f"ANI declares {declared_frames} embedded icon frame(s), "
+            f"but only {len(icons)} icon chunk(s) were found"
+        )
+
+    declared_steps = int(anih.get("steps", 0) or 0)
+    if has_sequence_chunk:
+        if not sequence:
+            raise ValueError("ANI sequence chunk is present but empty")
+        if declared_steps > 0 and len(sequence) != declared_steps:
+            raise ValueError(
+                f"ANI sequence length {len(sequence)} does not match declared step count {declared_steps}"
+            )
+        steps = declared_steps or len(sequence)
+        if len(sequence) < steps:
+            raise ValueError(
+                f"ANI sequence length {len(sequence)} is shorter than the required {steps} animation step(s)"
+            )
+        validated_sequence = sequence[:steps]
+        for step_index, icon_index in enumerate(validated_sequence):
+            if icon_index < 0 or icon_index >= len(icons):
+                raise ValueError(
+                    f"ANI step {step_index} references icon index {icon_index}, "
+                    f"but only {len(icons)} embedded icon frame(s) are available"
+                )
+    else:
+        steps = declared_steps or len(icons)
+        if steps < 1:
+            raise ValueError("ANI file contains no animation steps")
+        if steps > len(icons):
+            raise ValueError(
+                f"ANI declares {steps} animation step(s) without a sequence chunk, "
+                f"but only {len(icons)} embedded icon frame(s) are available"
+            )
+        validated_sequence = list(range(steps))
+
+    if has_rate_chunk:
+        if not rates:
+            raise ValueError("ANI rate chunk is present but empty")
+        if len(rates) < steps:
+            rates = rates + [anih["display_rate_jiffies"]] * (steps - len(rates))
+    else:
+        rates = [anih["display_rate_jiffies"]] * steps
+
+    return steps, validated_sequence, rates
+
+
 def parse_ani_bytes(data: bytes) -> dict:
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"ACON":
         raise ValueError("not an ANI file")
@@ -89,6 +152,8 @@ def parse_ani_bytes(data: bytes) -> dict:
     rates = []
     sequence = []
     icons = []
+    has_rate_chunk = False
+    has_sequence_chunk = False
 
     for chunk_id, payload_start, payload_end in _iter_riff_chunks(data, 12, riff_end):
         if chunk_id == "anih":
@@ -107,8 +172,10 @@ def parse_ani_bytes(data: bytes) -> dict:
                 "flags": fields[8],
             }
         elif chunk_id == "rate":
+            has_rate_chunk = True
             rates = _parse_u32_chunk("rate", data[payload_start:payload_end])
         elif chunk_id == "seq ":
+            has_sequence_chunk = True
             sequence = _parse_u32_chunk("seq", data[payload_start:payload_end])
         elif chunk_id == "LIST":
             if payload_end - payload_start < 4:
@@ -120,32 +187,18 @@ def parse_ani_bytes(data: bytes) -> dict:
                 if subchunk_id == "icon":
                     icons.append(data[sub_start:sub_end])
 
-    if not anih:
-        raise ValueError("ANI file is missing an anih chunk")
-    if not icons:
-        raise ValueError("ANI file contains no icon frames")
-
-    steps = anih["steps"] or len(sequence) or len(icons)
-    if steps < 1:
-        raise ValueError("ANI file contains no animation steps")
-    if not sequence:
-        sequence = list(range(min(steps, len(icons))))
-    if not rates:
-        rates = [anih["display_rate_jiffies"]] * steps
-    if len(rates) < steps:
-        rates.extend([anih["display_rate_jiffies"]] * (steps - len(rates)))
+    steps, sequence, rates = _validate_ani_chunks(
+        anih,
+        has_rate_chunk=has_rate_chunk,
+        rates=rates,
+        has_sequence_chunk=has_sequence_chunk,
+        sequence=sequence,
+        icons=icons,
+    )
 
     frame_entries = []
     for step_index in range(steps):
-        if step_index < len(sequence):
-            icon_index = sequence[step_index]
-        else:
-            icon_index = step_index
-        if icon_index >= len(icons):
-            raise ValueError(
-                f"ANI step {step_index} references icon index {icon_index}, "
-                f"but only {len(icons)} embedded icon frame(s) are available"
-            )
+        icon_index = sequence[step_index]
         icon_bytes = icons[icon_index]
         cur_info = parse_cur_bytes(icon_bytes)
         delay_jiffies = rates[step_index]

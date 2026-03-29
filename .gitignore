@@ -24,3 +24,6 @@ slot-assets/
 *.json
 !README.md
 !tools/*.json
+
+NEXT_SESSION_PROMPT.md
+NEXT_SESSION_PROMPT_SHORT.md
