@@ -94,6 +94,8 @@ The analysis stage also includes snapshot cards so users can judge pack quality 
 
 Click `Auto-Fill From Pack` to run the prepare step and populate the slot review stage using the same analyzed source data.
 
+Generic auto-fill keeps `default_pointer` mapped to actual arrow/default candidates and keeps `progress` / appstart behavior separate. The older animated-default-pointer behavior remains opt-in through the CLI flag described below.
+
 ### Stage 2: Slot Review / Correction
 
 This stage is visual-first instead of path-first.

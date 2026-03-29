@@ -66,7 +66,7 @@ SLOT_DEFS = [
             "top_left_arrow",
             "wayland-cursor",
         ],
-        "keywords": ("arrow", "default", "normal", "pointer", "cursor", "start"),
+        "keywords": ("arrow", "default", "normal", "pointer", "cursor"),
     },
     {
         "key": "help",
