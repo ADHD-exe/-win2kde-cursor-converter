@@ -27,6 +27,8 @@ from slot_definitions import (
     SCALE_FILTER_CHOICES,
     SLOT_BY_KEY,
     SLOT_DEFS,
+    format_cursor_sizes,
+    normalize_cursor_sizes,
 )
 from windows_cursor_tool import extract_asset, sanitize_path_component
 
@@ -43,10 +45,11 @@ def build_payload(
     target_sizes: list[int] | None = None,
     scale_filter: str = DEFAULT_SCALE_FILTER,
 ) -> dict:
+    sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
     return {
         "mapping_format_version": 2,
         "build_options": {
-            "target_sizes": list(target_sizes or DEFAULT_CURSOR_SIZES),
+            "target_sizes": sizes,
             "scale_filter": scale_filter,
         },
         "selected_slots": {
@@ -315,7 +318,8 @@ class MappingApp:
         self.scale_filter_var = tk.StringVar(value=DEFAULT_SCALE_FILTER)
         self.summary_var = tk.StringVar(value="0 source slots selected")
         self.status_var = tk.StringVar(value="Ready")
-        self.size_summary_var = tk.StringVar(value=", ".join(str(size) for size in DEFAULT_CURSOR_SIZES))
+        self.target_sizes = list(DEFAULT_CURSOR_SIZES)
+        self.target_sizes_var = tk.StringVar(value=format_cursor_sizes(self.target_sizes))
 
         outer = ttk.Frame(root, padding=12)
         outer.pack(fill="both", expand=True)
@@ -351,7 +355,7 @@ class MappingApp:
                 "1. Choose the Windows cursor folder.\n"
                 "2. Click Auto-Fill From Pack.\n"
                 "3. Check the slot previews and fix any paths that look wrong.\n"
-                "4. Confirm the scale filter and output root.\n"
+                "4. Confirm the output sizes, scale filter, and output root.\n"
                 "5. Click Build + Package.\n"
                 "6. Install the generated .tar.gz cursor theme."
             ),
@@ -384,7 +388,11 @@ class MappingApp:
         ).grid(row=3, column=1, sticky="w", pady=3)
 
         ttk.Label(workflow, text="Output sizes").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Label(workflow, textvariable=self.size_summary_var).grid(row=4, column=1, sticky="w", pady=3)
+        sizes_entry = ttk.Entry(workflow, textvariable=self.target_sizes_var, width=32)
+        sizes_entry.grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Label(workflow, text="comma-separated, e.g. 24, 32, 48, 96, 128, 192, 256").grid(
+            row=4, column=3, sticky="w", pady=3
+        )
 
         slot_frame = ttk.LabelFrame(outer, text="Source Slots", padding=10)
         slot_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
@@ -445,6 +453,7 @@ class MappingApp:
         self.preview.configure(yscrollcommand=yscroll.set)
 
         self.refresh_preview()
+        self.target_sizes_var.trace_add("write", lambda *_: self.refresh_preview())
 
     def set_status(self, message: str):
         self.status_var.set(message)
@@ -498,6 +507,15 @@ class MappingApp:
             row.clear()
             row.set_preview(None)
 
+    def current_target_sizes(self, normalize_display: bool = False) -> list[int]:
+        sizes = normalize_cursor_sizes(self.target_sizes_var.get(), fallback=self.target_sizes)
+        self.target_sizes = sizes
+        if normalize_display:
+            normalized_text = format_cursor_sizes(sizes)
+            if self.target_sizes_var.get().strip() != normalized_text:
+                self.target_sizes_var.set(normalized_text)
+        return sizes
+
     def apply_payload(self, payload: dict):
         self.clear_rows()
         selected = payload.get("selected_slots", {})
@@ -510,10 +528,8 @@ class MappingApp:
             self.scale_filter_var.set(scale_filter)
 
         target_sizes = build_options.get("target_sizes")
-        if isinstance(target_sizes, list) and target_sizes:
-            self.size_summary_var.set(", ".join(str(int(size)) for size in target_sizes))
-        else:
-            self.size_summary_var.set(", ".join(str(size) for size in DEFAULT_CURSOR_SIZES))
+        self.target_sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
+        self.target_sizes_var.set(format_cursor_sizes(self.target_sizes))
 
         for slot_key, item in sorted(selected.items()):
             row = self.rows_by_key.get(slot_key)
@@ -573,13 +589,13 @@ class MappingApp:
 
         return selected_slots, resolved
 
-    def render_markdown(self, selected_slots, resolved):
+    def render_markdown(self, selected_slots, resolved, target_sizes):
         lines = [
             "# Cursor Source Slot Mapping",
             "",
             "## Build Options",
             "",
-            f"- Sizes: `{', '.join(str(size) for size in DEFAULT_CURSOR_SIZES)}`",
+            f"- Sizes: `{format_cursor_sizes(target_sizes)}`",
             f"- Scale filter: `{self.scale_filter_var.get()}`",
             "",
             "## Selected Source Slots",
@@ -609,7 +625,8 @@ class MappingApp:
         self.refresh_slot_previews()
         try:
             selected_slots, resolved = self.gather_mapping()
-            text = self.render_markdown(selected_slots, resolved)
+            target_sizes = self.current_target_sizes()
+            text = self.render_markdown(selected_slots, resolved, target_sizes)
             self.summary_var.set(
                 f"{len(selected_slots)} source slots selected, {len(resolved)} Linux cursor roles resolved"
             )
@@ -642,6 +659,7 @@ class MappingApp:
     def save_json(self):
         try:
             selected_slots, resolved = self.gather_mapping()
+            target_sizes = self.current_target_sizes(normalize_display=True)
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
@@ -649,7 +667,7 @@ class MappingApp:
         payload = build_payload(
             selected_slots,
             resolved,
-            DEFAULT_CURSOR_SIZES,
+            target_sizes,
             self.scale_filter_var.get(),
         )
         target = filedialog.asksaveasfilename(
@@ -668,6 +686,7 @@ class MappingApp:
     def save_markdown(self):
         try:
             selected_slots, resolved = self.gather_mapping()
+            target_sizes = self.current_target_sizes(normalize_display=True)
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
@@ -679,7 +698,7 @@ class MappingApp:
         )
         if not target:
             return
-        Path(target).write_text(self.render_markdown(selected_slots, resolved), encoding="utf-8")
+        Path(target).write_text(self.render_markdown(selected_slots, resolved, target_sizes), encoding="utf-8")
         self.set_status(f"Saved preview markdown: {target}")
         messagebox.showinfo("Saved", f"Saved Markdown mapping to:\n{target}")
 
@@ -719,6 +738,7 @@ class MappingApp:
     def build_and_package(self):
         try:
             selected_slots, resolved = self.gather_mapping()
+            target_sizes = self.current_target_sizes(normalize_display=True)
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
@@ -749,7 +769,7 @@ class MappingApp:
         payload = build_payload(
             selected_slots,
             resolved,
-            DEFAULT_CURSOR_SIZES,
+            target_sizes,
             self.scale_filter_var.get(),
         )
         build_root = work_root / "_builds" / safe_theme_name
@@ -781,7 +801,7 @@ class MappingApp:
                 mapping_path,
                 build_root,
                 safe_theme_name,
-                DEFAULT_CURSOR_SIZES,
+                target_sizes,
                 scale_filter=self.scale_filter_var.get(),
             )
             built_theme_dir = Path(manifest["theme_dir"]).resolve()

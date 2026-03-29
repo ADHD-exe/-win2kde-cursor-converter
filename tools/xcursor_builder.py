@@ -10,7 +10,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from slot_definitions import DEFAULT_CURSOR_SIZES, DEFAULT_SCALE_FILTER, SCALE_FILTER_CHOICES
+from slot_definitions import (
+    DEFAULT_CURSOR_SIZES,
+    DEFAULT_SCALE_FILTER,
+    SCALE_FILTER_CHOICES,
+    normalize_cursor_sizes,
+)
 from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
@@ -486,7 +491,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    sizes = sorted({int(part) for part in args.sizes.split(",") if part.strip()})
+    sizes = normalize_cursor_sizes(args.sizes, fallback=DEFAULT_CURSOR_SIZES)
     manifest = build_theme(args.source_dir, args.build_root, args.variant, sizes, scale_filter=args.scale_filter)
     print(json.dumps(manifest, indent=2))
     return 0

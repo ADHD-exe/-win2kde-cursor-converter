@@ -24,7 +24,12 @@ from xcursor_builder import (
     write_config,
     write_theme_metadata,
 )
-from slot_definitions import DEFAULT_CURSOR_SIZES, DEFAULT_SCALE_FILTER, SCALE_FILTER_CHOICES
+from slot_definitions import (
+    DEFAULT_CURSOR_SIZES,
+    DEFAULT_SCALE_FILTER,
+    SCALE_FILTER_CHOICES,
+    normalize_cursor_sizes,
+)
 from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
@@ -37,11 +42,7 @@ def unique_extract_dir(base: Path, source_path: Path) -> Path:
 
 
 def parse_size_list(raw_sizes: str | list[int] | None) -> list[int]:
-    if raw_sizes is None:
-        return list(DEFAULT_CURSOR_SIZES)
-    if isinstance(raw_sizes, list):
-        return sorted({int(size) for size in raw_sizes})
-    return sorted({int(part) for part in str(raw_sizes).split(",") if part.strip()})
+    return normalize_cursor_sizes(raw_sizes, fallback=DEFAULT_CURSOR_SIZES)
 
 
 def load_mapping(mapping_path: Path) -> dict:
@@ -297,18 +298,18 @@ def main() -> int:
     parser.add_argument("--theme-name", default="Custom-cursor")
     parser.add_argument(
         "--sizes",
-        default=",".join(str(size) for size in DEFAULT_CURSOR_SIZES),
-        help="comma-separated cursor sizes to emit",
+        default=None,
+        help="comma-separated cursor sizes to emit; omit to use build_options.target_sizes from the mapping JSON",
     )
     parser.add_argument(
         "--scale-filter",
-        default=DEFAULT_SCALE_FILTER,
+        default=None,
         choices=SCALE_FILTER_CHOICES,
-        help="ImageMagick resize filter to use when scaling is required",
+        help="ImageMagick resize filter to use when scaling is required; omit to use the mapping JSON value",
     )
     args = parser.parse_args()
 
-    sizes = parse_size_list(args.sizes)
+    sizes = parse_size_list(args.sizes) if args.sizes else None
     manifest = build_theme_from_mapping(
         args.mapping_json,
         args.output_root,

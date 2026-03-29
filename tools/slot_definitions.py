@@ -278,7 +278,7 @@ WINDOWS_ROLE_TO_SLOT = {
     "beam": "text",
     "text": "text",
     "pen": "pen",
-    "hand": "pen",
+    "hand": "hand",
     "no": "forbidden",
     "unavailable": "forbidden",
     "vert": "resize_vertical",
@@ -299,6 +299,30 @@ UNUSED = "-- unused --"
 SLOT_LABELS = [UNUSED] + [slot["label"] for slot in SLOT_DEFS]
 SLOT_BY_LABEL = {slot["label"]: slot for slot in SLOT_DEFS}
 SLOT_BY_KEY = {slot["key"]: slot for slot in SLOT_DEFS}
+
+
+def normalize_cursor_sizes(
+    raw_sizes: str | list[int] | tuple[int, ...] | set[int] | None,
+    fallback: list[int] | None = None,
+) -> list[int]:
+    if raw_sizes is None:
+        return list(fallback or DEFAULT_CURSOR_SIZES)
+
+    if isinstance(raw_sizes, (list, tuple, set)):
+        parts = raw_sizes
+    else:
+        parts = str(raw_sizes).split(",")
+
+    sizes = sorted({int(str(part).strip()) for part in parts if str(part).strip()})
+    if not sizes:
+        raise ValueError("cursor sizes must contain at least one positive integer")
+    if any(size <= 0 for size in sizes):
+        raise ValueError("cursor sizes must be positive integers")
+    return sizes
+
+
+def format_cursor_sizes(raw_sizes: str | list[int] | tuple[int, ...] | set[int] | None) -> str:
+    return ", ".join(str(size) for size in normalize_cursor_sizes(raw_sizes))
 
 
 def normalized_tokens(name: str) -> list[str]:

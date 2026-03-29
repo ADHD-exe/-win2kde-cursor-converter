@@ -20,11 +20,24 @@ from slot_definitions import (
     SLOT_BY_KEY,
     SLOT_DEFS,
     WINDOWS_ROLE_TO_SLOT,
+    normalize_cursor_sizes,
     score_slot_match,
 )
 
 
 WINDOWS_CURSOR_EXTENSIONS = {".ani", ".cur", ".png"}
+LOW_PRIORITY_DIR_NAMES = {
+    "__pycache__",
+    "_builds",
+    "_prepared",
+    "_preview-cache",
+    "build",
+    "builds",
+    "cache",
+    "dist",
+    "temp",
+    "tmp",
+}
 
 
 def discover_cursor_files(source_dir: Path) -> list[Path]:
@@ -83,7 +96,24 @@ def parse_install_inf(source_dir: Path) -> tuple[Path | None, dict[str, Path]]:
     return inf_path, mapping
 
 
-def heuristic_slot_candidates(cursor_files: list[Path]) -> dict[str, list[dict]]:
+def candidate_path_priority(source_dir: Path, path: Path) -> tuple[int, int, str, str]:
+    try:
+        relative = path.resolve().relative_to(source_dir.resolve())
+    except ValueError:
+        relative = path.resolve()
+
+    parents = relative.parts[:-1]
+    low_priority_hits = sum(1 for part in parents if part.lower() in LOW_PRIORITY_DIR_NAMES)
+    depth = len(parents)
+    return (
+        low_priority_hits,
+        depth,
+        relative.name.lower(),
+        str(relative).lower(),
+    )
+
+
+def heuristic_slot_candidates(source_dir: Path, cursor_files: list[Path]) -> dict[str, list[dict]]:
     candidates: dict[str, list[dict]] = {slot["key"]: [] for slot in SLOT_DEFS}
 
     for path in cursor_files:
@@ -100,7 +130,9 @@ def heuristic_slot_candidates(cursor_files: list[Path]) -> dict[str, list[dict]]
             )
 
     for slot_key in candidates:
-        candidates[slot_key].sort(key=lambda item: (-item["score"], item["path"].name))
+        candidates[slot_key].sort(
+            key=lambda item: (-item["score"],) + candidate_path_priority(source_dir, item["path"])
+        )
     return candidates
 
 
@@ -138,7 +170,7 @@ def is_animated_default_pointer_candidate(path: Path) -> bool:
 
 def choose_slot_assignments(source_dir: Path, cursor_files: list[Path]) -> tuple[dict[str, Path], dict]:
     inf_path, inf_mapping = parse_install_inf(source_dir)
-    heuristic_candidates = heuristic_slot_candidates(cursor_files)
+    heuristic_candidates = heuristic_slot_candidates(source_dir, cursor_files)
     chosen: dict[str, Path] = {}
     diagnostics = {
         "install_inf": str(inf_path) if inf_path else None,
@@ -216,6 +248,7 @@ def build_mapping_payload(
     target_sizes: list[int] | None = None,
     scale_filter: str = DEFAULT_SCALE_FILTER,
 ) -> dict:
+    sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
     selected_payload = {}
     resolved = {}
     for slot_key, source_path in selected_slots.items():
@@ -230,7 +263,7 @@ def build_mapping_payload(
     return {
         "mapping_format_version": 2,
         "build_options": {
-            "target_sizes": list(target_sizes or DEFAULT_CURSOR_SIZES),
+            "target_sizes": sizes,
             "scale_filter": scale_filter,
         },
         "selected_slots": selected_payload,
