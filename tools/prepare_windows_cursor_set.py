@@ -90,7 +90,8 @@ def parse_install_inf(source_dir: Path) -> tuple[Path | None, dict[str, Path]]:
         slot_key = WINDOWS_ROLE_TO_SLOT.get(role_name.lower())
         if not slot_key:
             continue
-        candidate = source_dir / file_name.strip().strip('"')
+        normalized_name = re.sub(r"[\\/]+", "/", file_name.strip().strip('"'))
+        candidate = source_dir.joinpath(*Path(normalized_name).parts)
         if candidate.exists():
             mapping[slot_key] = candidate.resolve()
     return inf_path, mapping
