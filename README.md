@@ -378,6 +378,15 @@ Manual metadata JSON validation remains strict:
 - provided width and height must match the actual PNG dimensions
 - hotspots must be within the PNG bounds
 
+## Validation
+
+Quick local validation commands:
+
+```bash
+python -m py_compile tools/source_slot_mapper_gui.py tools/gui_task_runner.py tools/preview_cache.py
+python -m unittest discover -s tests -q
+```
+
 ## Notes
 
 - generic conversion stays theme-agnostic by default
