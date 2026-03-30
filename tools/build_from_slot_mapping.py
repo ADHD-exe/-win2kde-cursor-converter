@@ -22,6 +22,7 @@ from xcursor_builder import (
     ensure_clean_dir,
     file_cache_token,
     prepare_scaled_frames,
+    prepare_scaled_frames_for_size,
     write_config,
     write_theme_metadata,
 )
@@ -47,6 +48,10 @@ MAPPING_FORMAT_VERSION = 2
 
 def unique_extract_dir(base: Path, source_path: Path) -> Path:
     return cache_artifact_dir(base, source_path)
+
+
+def owned_build_root(output_root: Path, theme_name: str) -> Path:
+    return output_root / "_cursorforge-build" / sanitize_path_component(theme_name)
 
 
 def parse_size_list(raw_sizes: str | list[int] | None) -> list[int]:
@@ -293,30 +298,24 @@ def prepare_output_preview_metadata(
     source_cache_root = (source_cache_root or preview_root.parent / "_source").expanduser().resolve()
     asset_work_dir = unique_extract_dir(preview_root, source_path)
     metadata = source_metadata if source_metadata is not None else load_source_metadata(source_path, source_cache_root)
-    if source_path.suffix.lower() not in {".json", ".png"}:
-        touch_cache_path(unique_extract_dir(source_cache_root, source_path))
-        prune_cache_dir(source_cache_root, MAX_SOURCE_CACHE_DIRS)
-    prepared = prepare_scaled_frames(
-        metadata,
-        sizes,
-        scale_filter=filter_name,
-        generated_dir=asset_work_dir,
-    )
-    localized = localize_metadata_frames(prepared, asset_work_dir)
-    available_nominal_sizes = sorted(
-        {int(frame.get("nominal_size", frame["width"])) for frame in localized["frames"]}
-    )
+    available_nominal_sizes = list(sizes)
     desired_size = (
         int(preview_nominal_size)
         if preview_nominal_size is not None
         else choose_preview_nominal_size(available_nominal_sizes)
     )
     selected_nominal_size = min(available_nominal_sizes, key=lambda size: (abs(size - desired_size), size))
-    preview_frames = [
-        frame
-        for frame in localized["frames"]
-        if int(frame.get("nominal_size", frame["width"])) == selected_nominal_size
-    ]
+    if source_path.suffix.lower() not in {".json", ".png"}:
+        touch_cache_path(unique_extract_dir(source_cache_root, source_path))
+        prune_cache_dir(source_cache_root, MAX_SOURCE_CACHE_DIRS)
+    prepared = prepare_scaled_frames_for_size(
+        metadata,
+        selected_nominal_size,
+        scale_filter=filter_name,
+        generated_dir=asset_work_dir,
+    )
+    localized = localize_metadata_frames(prepared, asset_work_dir)
+    preview_frames = localized["frames"]
     if not preview_frames:
         raise ValueError(f"no prepared frames available for preview size {selected_nominal_size}")
 
@@ -350,12 +349,16 @@ def build_theme_from_mapping(
         choices = ", ".join(SCALE_FILTER_CHOICES)
         raise ValueError(f"unsupported scale filter {filter_name!r}; expected one of: {choices}")
 
+    output_root = output_root.expanduser().resolve()
     theme_dir = output_root / theme_name
-    extracted_dir = output_root / "_extracted"
-    configs_dir = output_root / "_configs"
+    build_root = owned_build_root(output_root, theme_name)
+    extracted_dir = build_root / "extracted"
+    configs_dir = build_root / "configs"
     cursors_dir = theme_dir / "cursors"
 
-    ensure_clean_dir(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    ensure_clean_dir(theme_dir)
+    ensure_clean_dir(build_root)
     extracted_dir.mkdir(parents=True, exist_ok=True)
     configs_dir.mkdir(parents=True, exist_ok=True)
     cursors_dir.mkdir(parents=True, exist_ok=True)
@@ -368,6 +371,7 @@ def build_theme_from_mapping(
         "target_sizes": sizes,
         "scale_filter": filter_name,
         "theme_dir": str(theme_dir),
+        "build_root": str(build_root),
         "built_assets": {},
     }
 
@@ -416,7 +420,7 @@ def build_theme_from_mapping(
         comment="Cursor theme built from a slot-mapping JSON exported by the source slot mapper",
     )
 
-    manifest_path = output_root / "build-manifest.json"
+    manifest_path = build_root / "build-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)
     return manifest

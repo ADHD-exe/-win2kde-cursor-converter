@@ -493,15 +493,28 @@ def choose_slot_assignments(
     cursor_files: list[Path],
     *,
     prefer_animated_default_pointer: bool = False,
+    analysis: dict | None = None,
 ) -> tuple[dict[str, Path], dict]:
     source_dir = source_dir.expanduser().resolve()
-    inf_path, inf_mapping = parse_install_inf(source_dir)
-    analysis = analyze_cursor_pack(source_dir, cursor_files)
+    cursor_files = [path.resolve() for path in cursor_files]
+    if analysis is None:
+        analysis = analyze_cursor_pack(source_dir, cursor_files)
+
+    inf_details = analysis.get("install_inf")
+    install_inf_mapping = analysis.get("install_inf_mapping")
+    if install_inf_mapping is None:
+        inf_path, inf_mapping = parse_install_inf(source_dir)
+    else:
+        inf_path = None if inf_details is None else Path(inf_details["path"]).resolve()
+        inf_mapping = {
+            slot_key: Path(path).expanduser().resolve()
+            for slot_key, path in install_inf_mapping.items()
+        }
     heuristic_candidates = analysis["slot_candidates"]
     chosen: dict[str, Path] = {}
     diagnostics = {
         "install_inf": str(inf_path) if inf_path else None,
-        "install_inf_reason": None if analysis["install_inf"] is None else analysis["install_inf"]["reason"],
+        "install_inf_reason": None if inf_details is None else inf_details["reason"],
         "chosen_by_inf": {},
         "chosen_by_heuristic": {},
         "unmatched_files": [],
@@ -648,6 +661,7 @@ def prepare_windows_cursor_set(
         source_dir,
         cursor_files,
         prefer_animated_default_pointer=prefer_animated_default_pointer,
+        analysis=analysis,
     )
     selected_slots = {slot_key: source_path.resolve() for slot_key, source_path in sorted(chosen.items())}
 
