@@ -68,15 +68,22 @@ class GuiTaskRunner:
         *,
         on_success: Callable[[TaskToken, T], None] | None,
         on_error: Callable[[TaskToken, BaseException], None] | None = None,
+        should_run: Callable[[TaskToken], bool] | None = None,
     ) -> None:
         if self._closed:
             return
 
         def run() -> None:
             try:
+                if should_run is not None and not should_run(token):
+                    return
                 result = work()
             except BaseException as exc:  # noqa: BLE001
+                if should_run is not None and not should_run(token):
+                    return
                 self._queue.put(_TaskDelivery(token=token, callback=on_error, payload=exc))
+                return
+            if should_run is not None and not should_run(token):
                 return
             self._queue.put(_TaskDelivery(token=token, callback=on_success, payload=result))
 
@@ -120,3 +127,53 @@ class GuiTaskRunner:
                 self.close()
                 return
         self._schedule_drain()
+
+
+class TkAfterCoalescer:
+    """Coalesces Tk after() callbacks by key so only the newest one runs."""
+
+    def __init__(self, root: tk.Misc) -> None:
+        self.root = root
+        self._after_ids: dict[str, str] = {}
+        self._closed = False
+
+    def schedule(self, key: str, delay_ms: int, callback: Callable[[], None]) -> None:
+        if self._closed:
+            return
+        self.cancel(key)
+
+        def run() -> None:
+            self._after_ids.pop(key, None)
+            if self._closed:
+                return
+            try:
+                callback()
+            except tk.TclError:
+                self.close()
+
+        try:
+            after_id = self.root.after(max(1, int(delay_ms)), run)
+        except tk.TclError:
+            self.close()
+            return
+        self._after_ids[key] = after_id
+
+    def cancel(self, key: str) -> None:
+        after_id = self._after_ids.pop(key, None)
+        if after_id is None:
+            return
+        try:
+            self.root.after_cancel(after_id)
+        except tk.TclError:
+            self._closed = True
+
+    def cancel_many(self, *keys: str) -> None:
+        for key in keys:
+            self.cancel(key)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for key in tuple(self._after_ids):
+            self.cancel(key)

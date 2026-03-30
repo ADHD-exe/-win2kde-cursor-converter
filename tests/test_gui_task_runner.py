@@ -1,5 +1,6 @@
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -9,8 +10,29 @@ TOOLS_DIR = REPO_ROOT / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from gui_task_runner import RequestTracker
+from gui_task_runner import GuiTaskRunner, RequestTracker, TkAfterCoalescer
 from preview_cache import BoundedCache
+
+
+class FakeAfterRoot:
+    def __init__(self) -> None:
+        self._callbacks: dict[str, object] = {}
+        self._counter = 0
+
+    def after(self, _delay_ms: int, callback):
+        self._counter += 1
+        callback_id = f"after-{self._counter}"
+        self._callbacks[callback_id] = callback
+        return callback_id
+
+    def after_cancel(self, callback_id: str) -> None:
+        self._callbacks.pop(callback_id, None)
+
+    def run_pending_once(self) -> None:
+        current = list(self._callbacks.items())
+        self._callbacks.clear()
+        for _callback_id, callback in current:
+            callback()
 
 
 class RequestTrackerTests(unittest.TestCase):
@@ -37,6 +59,47 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(generation, 2)
         self.assertFalse(tracker.is_current(token))
         self.assertEqual(tracker.current("candidate-preview"), 2)
+
+
+class TkAfterCoalescerTests(unittest.TestCase):
+    def test_last_scheduled_callback_wins_for_same_key(self) -> None:
+        root = FakeAfterRoot()
+        coalescer = TkAfterCoalescer(root)
+        calls: list[str] = []
+
+        coalescer.schedule("refresh", 10, lambda: calls.append("first"))
+        coalescer.schedule("refresh", 10, lambda: calls.append("second"))
+        root.run_pending_once()
+
+        self.assertEqual(calls, ["second"])
+
+
+class GuiTaskRunnerShouldRunTests(unittest.TestCase):
+    def test_stale_work_is_skipped_before_delivery(self) -> None:
+        root = FakeAfterRoot()
+        runner = GuiTaskRunner(root, max_workers=1, poll_interval_ms=1)
+        tracker = RequestTracker()
+        token = tracker.next("preview")
+        gate = threading.Event()
+        delivered: list[str] = []
+
+        def work() -> str:
+            gate.wait(timeout=1.0)
+            return "ready"
+
+        runner.submit(
+            token,
+            work,
+            on_success=lambda _token, payload: delivered.append(payload),
+            should_run=tracker.is_current,
+        )
+        tracker.invalidate("preview")
+        gate.set()
+        time.sleep(0.05)
+        root.run_pending_once()
+        runner.close()
+
+        self.assertEqual(delivered, [])
 
 
 class BoundedCacheThreadSafetyTests(unittest.TestCase):

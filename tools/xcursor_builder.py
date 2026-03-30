@@ -442,6 +442,44 @@ def ensure_scaled_png(
     return output_path
 
 
+def _prepare_scaled_frame(
+    frame: dict,
+    target_size: int,
+    scale_filter: str,
+    generated_dir: Path | None,
+) -> dict:
+    normalized_target_size = int(target_size)
+    if normalized_target_size <= 0:
+        raise ValueError("target size must be a positive integer")
+
+    native_entry = choose_best_entry(frame["entries"], normalized_target_size)
+    source_png = Path(native_entry["png"])
+    if native_entry["width"] == normalized_target_size and native_entry["height"] == normalized_target_size:
+        output_png = source_png
+    else:
+        scaled_dir = generated_dir if generated_dir is not None else source_png.parent
+        output_png = ensure_scaled_png(source_png, scaled_dir, normalized_target_size, scale_filter)
+    output_width, output_height = identify_png_size(output_png)
+
+    return {
+        "png": str(output_png),
+        "delay_ms": frame["delay_ms"],
+        "width": output_width,
+        "height": output_height,
+        # Keep the requested cursor size as the Xcursor nominal size,
+        # but preserve the emitted PNG dimensions and per-axis hotspot scaling.
+        "nominal_size": normalized_target_size,
+        "hotspot_x": scale_hotspot(native_entry["hotspot_x"], native_entry["width"], output_width),
+        "hotspot_y": scale_hotspot(native_entry["hotspot_y"], native_entry["height"], output_height),
+        "frame_index": frame["frame_index"],
+        "entry_index": native_entry.get("entry_index"),
+        "native_width": native_entry["width"],
+        "native_height": native_entry["height"],
+        "native_image_size": native_entry.get("image_size"),
+        "native_colors": native_entry.get("colors"),
+    }
+
+
 def prepare_scaled_frames(
     metadata: dict,
     target_sizes: list[int],
@@ -461,36 +499,31 @@ def prepare_scaled_frames(
 
     for frame in normalized["frames"]:
         for size in target_sizes:
-            native_entry = choose_best_entry(frame["entries"], size)
-            source_png = Path(native_entry["png"])
-            if native_entry["width"] == size and native_entry["height"] == size:
-                output_png = source_png
-            else:
-                scaled_dir = cache_dir if cache_dir is not None else source_png.parent
-                output_png = ensure_scaled_png(source_png, scaled_dir, size, filter_name)
-            output_width, output_height = identify_png_size(output_png)
-
-            build_frames["frames"].append(
-                {
-                    "png": str(output_png),
-                    "delay_ms": frame["delay_ms"],
-                    "width": output_width,
-                    "height": output_height,
-                    # Keep the requested cursor size as the Xcursor nominal size,
-                    # but preserve the emitted PNG dimensions and per-axis hotspot scaling.
-                    "nominal_size": size,
-                    "hotspot_x": scale_hotspot(native_entry["hotspot_x"], native_entry["width"], output_width),
-                    "hotspot_y": scale_hotspot(native_entry["hotspot_y"], native_entry["height"], output_height),
-                    "frame_index": frame["frame_index"],
-                    "entry_index": native_entry.get("entry_index"),
-                    "native_width": native_entry["width"],
-                    "native_height": native_entry["height"],
-                    "native_image_size": native_entry.get("image_size"),
-                    "native_colors": native_entry.get("colors"),
-                }
-            )
+            build_frames["frames"].append(_prepare_scaled_frame(frame, size, filter_name, cache_dir))
 
     return build_frames
+
+
+def prepare_scaled_frames_for_size(
+    metadata: dict,
+    target_size: int,
+    scale_filter: str = DEFAULT_SCALE_FILTER,
+    generated_dir: Path | None = None,
+) -> dict:
+    normalized = normalize_metadata(metadata)
+    filter_name = validate_scale_filter(scale_filter)
+    preview_frames = {
+        "source": normalized["source"],
+        "asset_type": normalized["asset_type"],
+        "scale_filter": filter_name,
+        "frames": [],
+    }
+
+    cache_dir = generated_dir if generated_dir is not None else None
+    for frame in normalized["frames"]:
+        preview_frames["frames"].append(_prepare_scaled_frame(frame, target_size, filter_name, cache_dir))
+
+    return preview_frames
 
 
 def write_config(config_path: Path, metadata: dict) -> None:

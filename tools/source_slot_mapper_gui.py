@@ -38,11 +38,17 @@ from preview_cache import (
     source_cache_identity,
     touch_cache_path,
 )
-from gui_task_runner import GuiTaskRunner, RequestTracker, TaskToken
+from gui_build_profile import (
+    BuildProfileState,
+    build_profile_payload,
+    resolve_build_profile_state,
+    restore_profile_base_preset,
+)
+from gui_task_runner import GuiTaskRunner, RequestTracker, TaskToken, TkAfterCoalescer
+from gui_workflow_summary import build_compare_guidance, build_readiness_snapshot
 from xcursor_builder import choose_best_entry
 from prepare_windows_cursor_set import analyze_cursor_pack, prepare_windows_cursor_set
 from slot_definitions import (
-    BUILD_PRESETS,
     BUILD_PRESET_LABELS,
     DEFAULT_CURSOR_SIZES,
     DEFAULT_SCALE_FILTER,
@@ -65,7 +71,11 @@ CARD_PREVIEW_SIZE = 48
 PLAYER_PREVIEW_SIZE = 132
 CANDIDATE_PREVIEW_SIZE = 96
 CANVAS_SLOT_GLYPH_SIZE = 28
-LOW_CONFIDENCE_LABELS = {"likely blurry", "redraw recommended"}
+BUILD_SETTINGS_REFRESH_MS = 140
+PREVIEW_SIZE_REFRESH_MS = 90
+SELECTED_DETAIL_REFRESH_MS = 50
+CANDIDATE_DETAIL_REFRESH_MS = 70
+COMPARE_REFRESH_MS = 60
 COMPARE_MODE_CURRENT_VS_CANDIDATE = "Current vs Candidate"
 COMPARE_MODE_SOURCE_VS_OUTPUT = "Source vs Linux Output"
 COMPARE_MODE_PRESET = "Current Build vs Compare Preset"
@@ -126,6 +136,7 @@ def build_payload(
     target_sizes: list[int] | None = None,
     scale_filter: str = DEFAULT_SCALE_FILTER,
     selection_context: dict | None = None,
+    build_profile: dict | None = None,
 ) -> dict:
     sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
     payload = {
@@ -146,6 +157,8 @@ def build_payload(
     }
     if selection_context:
         payload["selection_context"] = selection_context
+    if build_profile:
+        payload["build_profile"] = build_profile
     return payload
 
 
@@ -1791,12 +1804,14 @@ class MappingApp:
         self.slot_states = {slot["key"]: SlotRenderState() for slot in SLOT_DEFS}
         self.request_tracker = RequestTracker()
         self.task_runner = GuiTaskRunner(self.root)
+        self.refresh_coalescer = TkAfterCoalescer(self.root)
         self._suspend_refresh_traces = False
         self.analysis_busy = False
         self.auto_prepare_busy = False
         self.build_busy = False
         self.tooltips: list[ThemedTooltip] = []
         self.slot_paths = {slot["key"]: "" for slot in SLOT_DEFS}
+        self.profile_base_preset_label = resolve_build_preset("hidpi-kde")["label"]
 
         self.source_dir_var = tk.StringVar()
         self.work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
@@ -1809,7 +1824,20 @@ class MappingApp:
         self.build_preset_var = tk.StringVar(value=resolve_build_preset("hidpi-kde")["label"])
         self.preview_nominal_size_var = tk.StringVar(value=str(self._default_preview_size(self.target_sizes)))
         self.preset_description_var = tk.StringVar(value=describe_build_preset(self.build_preset_var.get()))
+        self.current_build_profile: BuildProfileState = resolve_build_profile_state(
+            self.target_sizes,
+            self.scale_filter_var.get(),
+            base_preset_label=self.profile_base_preset_label,
+        )
+        self.profile_state_var = tk.StringVar(value=self.current_build_profile.headline)
+        self.profile_match_var = tk.StringVar(value=self.current_build_profile.detail)
         self.overall_quality_var = tk.StringVar(value="Overall quality forecast: --")
+        self.readiness_var = tk.StringVar(value="Pack readiness: --")
+        self.readiness_detail_var = tk.StringVar(value="Build and review guidance will appear here.")
+        self.review_queue_var = tk.StringVar(value="Review queue: --")
+        self.review_queue_hint_var = tk.StringVar(
+            value="Auto-fill or assign slots, then use Compare to clear ambiguity and export risk."
+        )
         self.last_output_var = tk.StringVar(value="No build output yet")
         self.compare_mode_var = tk.StringVar(value=COMPARE_MODE_CURRENT_VS_CANDIDATE)
         self.compare_preset_var = tk.StringVar(value=SAFE_PRESET_LABEL)
@@ -1829,7 +1857,59 @@ class MappingApp:
         self.scale_filter_var.trace_add("write", lambda *_: self._on_scale_filter_changed())
         self.preview_nominal_size_var.trace_add("write", lambda *_: self._on_preview_size_changed())
         self.build_preset_var.trace_add("write", lambda *_: self._update_preset_description())
-        self.compare_preset_var.trace_add("write", lambda *_: self._refresh_compare_view())
+        self.compare_preset_var.trace_add("write", lambda *_: self._schedule_compare_view_refresh())
+
+    def _refresh_build_profile_state(self) -> None:
+        sizes, _size_error = self.try_target_sizes()
+        scale_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
+        self.current_build_profile = resolve_build_profile_state(
+            sizes,
+            scale_filter,
+            base_preset_label=self.profile_base_preset_label,
+        )
+        self.profile_state_var.set(self.current_build_profile.headline)
+        self.profile_match_var.set(self.current_build_profile.detail)
+
+    def _cancel_scheduled_refreshes(self) -> None:
+        self.refresh_coalescer.cancel_many(
+            "build-settings-refresh",
+            "preview-size-refresh",
+            "selected-detail-refresh",
+            "candidate-detail-refresh",
+            "compare-view-refresh",
+        )
+
+    def _schedule_build_settings_refresh(self) -> None:
+        self.refresh_coalescer.schedule("build-settings-refresh", BUILD_SETTINGS_REFRESH_MS, self._run_build_settings_refresh)
+
+    def _run_build_settings_refresh(self) -> None:
+        self._update_preview_size_choices()
+        self.output_preview_cache.clear()
+        self._refresh_all_views()
+
+    def _schedule_preview_size_refresh(self) -> None:
+        self.refresh_coalescer.schedule("preview-size-refresh", PREVIEW_SIZE_REFRESH_MS, self._run_preview_size_refresh)
+
+    def _run_preview_size_refresh(self) -> None:
+        self._refresh_slot_cards()
+        self._refresh_selected_slot_detail()
+
+    def _schedule_selected_slot_detail_refresh(self) -> None:
+        self.refresh_coalescer.schedule(
+            "selected-detail-refresh",
+            SELECTED_DETAIL_REFRESH_MS,
+            self._refresh_selected_slot_detail,
+        )
+
+    def _schedule_candidate_detail_refresh(self) -> None:
+        self.refresh_coalescer.schedule(
+            "candidate-detail-refresh",
+            CANDIDATE_DETAIL_REFRESH_MS,
+            self._refresh_candidate_detail,
+        )
+
+    def _schedule_compare_view_refresh(self) -> None:
+        self.refresh_coalescer.schedule("compare-view-refresh", COMPARE_REFRESH_MS, self._refresh_compare_view)
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=12)
@@ -2463,7 +2543,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         left = ttk.Frame(paned, padding=(0, 0, 8, 0))
         right = ttk.Frame(paned, padding=(8, 0, 0, 0))
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(3, weight=1)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
         paned.add(left, weight=3)
@@ -2475,9 +2555,20 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             wraplength=500,
             justify="left",
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(left, textvariable=self.review_queue_var, style="Heading.TLabel", wraplength=500, justify="left").grid(
+            row=1,
+            column=0,
+            sticky="ew",
+        )
+        ttk.Label(left, textvariable=self.review_queue_hint_var, style="Muted.TLabel", wraplength=500, justify="left").grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=(4, 8),
+        )
 
         slot_frame = ttk.Frame(left)
-        slot_frame.grid(row=1, column=0, sticky="nsew")
+        slot_frame.grid(row=3, column=0, sticky="nsew")
         slot_frame.columnconfigure(0, weight=1)
         slot_frame.rowconfigure(0, weight=1)
 
@@ -2594,7 +2685,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         candidate_scroll = ttk.Scrollbar(self.candidate_browser_tab, orient="vertical", command=self.candidate_tree.yview)
         candidate_scroll.grid(row=0, column=1, sticky="ns")
         self.candidate_tree.configure(yscrollcommand=candidate_scroll.set)
-        self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_candidate_detail())
+        self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._schedule_candidate_detail_refresh())
 
         candidate_detail = ttk.Frame(self.candidate_browser_tab)
         candidate_detail.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
@@ -2636,7 +2727,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             width=28,
         )
         self.compare_mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 12))
-        self.compare_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_compare_view())
+        self.compare_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._schedule_compare_view_refresh())
         ttk.Label(compare_controls, text="Compare preset").grid(row=0, column=2, sticky="e")
         self.compare_preset_combo = ttk.Combobox(
             compare_controls,
@@ -2680,7 +2771,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         top.columnconfigure(1, weight=1)
         top.columnconfigure(4, weight=1)
 
-        ttk.Label(top, text="Build preset").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Label(top, text="Preset to apply").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         self.preset_combo = ttk.Combobox(
             top,
             textvariable=self.build_preset_var,
@@ -2704,47 +2795,68 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             pady=3,
         )
 
-        ttk.Label(top, text="Theme name").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(top, textvariable=self.theme_name_var).grid(row=1, column=1, sticky="ew", pady=3)
-
-        ttk.Label(top, text="Output sizes").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(top, textvariable=self.target_sizes_var).grid(row=2, column=1, sticky="ew", pady=3)
-        ttk.Label(top, text="Scale filter").grid(row=2, column=2, sticky="e", padx=(10, 8), pady=3)
-        ttk.Combobox(top, textvariable=self.scale_filter_var, values=SCALE_FILTER_CHOICES, state="readonly", width=12).grid(
+        ttk.Label(top, textvariable=self.profile_state_var, style="Heading.TLabel", wraplength=1120, justify="left").grid(
+            row=1,
+            column=0,
+            columnspan=6,
+            sticky="w",
+            pady=(6, 0),
+        )
+        ttk.Label(top, textvariable=self.profile_match_var, style="Muted.TLabel", wraplength=1120, justify="left").grid(
             row=2,
+            column=0,
+            columnspan=6,
+            sticky="w",
+            pady=(2, 4),
+        )
+
+        ttk.Label(top, text="Theme name").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(top, textvariable=self.theme_name_var).grid(row=3, column=1, sticky="ew", pady=3)
+
+        ttk.Label(top, text="Output sizes").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(top, textvariable=self.target_sizes_var).grid(row=4, column=1, sticky="ew", pady=3)
+        ttk.Label(top, text="Scale filter").grid(row=4, column=2, sticky="e", padx=(10, 8), pady=3)
+        ttk.Combobox(top, textvariable=self.scale_filter_var, values=SCALE_FILTER_CHOICES, state="readonly", width=12).grid(
+            row=4,
             column=3,
             sticky="w",
             pady=3,
         )
-        ttk.Label(top, text="Predicted preview size").grid(row=2, column=4, sticky="e", padx=(10, 8), pady=3)
+        ttk.Label(top, text="Predicted preview size").grid(row=4, column=4, sticky="e", padx=(10, 8), pady=3)
         self.build_preview_size_combo = ttk.Combobox(
             top,
             textvariable=self.preview_nominal_size_var,
             state="readonly",
             width=10,
         )
-        self.build_preview_size_combo.grid(row=2, column=5, sticky="w", pady=3)
+        self.build_preview_size_combo.grid(row=4, column=5, sticky="w", pady=3)
 
-        ttk.Label(top, text="Output root").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(top, textvariable=self.work_root_var).grid(row=3, column=1, columnspan=4, sticky="ew", pady=3)
-        ttk.Button(top, text="Browse", command=self.choose_work_root).grid(row=3, column=5, padx=(8, 0), pady=3)
+        ttk.Label(top, text="Output root").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(top, textvariable=self.work_root_var).grid(row=5, column=1, columnspan=4, sticky="ew", pady=3)
+        ttk.Button(top, text="Browse", command=self.choose_work_root).grid(row=5, column=5, padx=(8, 0), pady=3)
 
         quality_frame = ttk.LabelFrame(self.build_tab, text="Quality Forecast And Validation", padding=10)
         quality_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(10, 0))
         quality_frame.columnconfigure(0, weight=1)
-        quality_frame.rowconfigure(2, weight=1)
-        ttk.Label(quality_frame, textvariable=self.overall_quality_var, font=("", 11, "bold"), style="Heading.TLabel").grid(
+        quality_frame.rowconfigure(3, weight=1)
+        ttk.Label(quality_frame, textvariable=self.readiness_var, font=("", 11, "bold"), style="Heading.TLabel").grid(
             row=0,
             column=0,
             sticky="w",
         )
+        ttk.Label(quality_frame, textvariable=self.readiness_detail_var, wraplength=720, justify="left", style="Muted.TLabel").grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(4, 0),
+        )
         quality_actions = ttk.Frame(quality_frame)
-        quality_actions.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        quality_actions.grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Button(quality_actions, text="Review Weak Slot", command=self.review_most_at_risk_slot).grid(row=0, column=0)
         ttk.Button(quality_actions, text="Open Compare", command=self.open_compare_view).grid(row=0, column=1, padx=(6, 0))
         ttk.Button(quality_actions, text=f"Use {SAFE_PRESET_LABEL}", command=self.apply_safe_preset).grid(row=0, column=2, padx=(6, 0))
         self.build_warning_text = tk.Text(quality_frame, wrap="word")
-        self.build_warning_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        self.build_warning_text.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         self._theme_text_widget(self.build_warning_text)
         set_readonly_text(self.build_warning_text, "Warnings and build guidance will appear here.")
 
@@ -2797,6 +2909,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             pass
 
     def on_close(self) -> None:
+        self.refresh_coalescer.close()
         self.task_runner.close()
         self.root.destroy()
 
@@ -3323,6 +3436,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         self._refresh_compare_view()
 
     def _refresh_compare_view(self) -> None:
+        self.refresh_coalescer.cancel("compare-view-refresh")
         if not hasattr(self, "compare_left_panel"):
             return
         mode = self.compare_mode_var.get().strip() or COMPARE_MODE_CURRENT_VS_CANDIDATE
@@ -3332,6 +3446,8 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             self.compare_preset_combo.configure(state="disabled")
 
         slot_label = SLOT_BY_KEY[self.selected_slot_key]["label"]
+        weak_hidpi = ((self.pack_analysis or {}).get("hidpi_potential", {}).get("rating") in {"weak", "limited"})
+        is_ambiguous = bool(self._ambiguous_candidates_for_slot(self.selected_slot_key))
         try:
             if mode == COMPARE_MODE_CURRENT_VS_CANDIDATE:
                 current_path = self._selected_slot_path()
@@ -3373,9 +3489,21 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                 current_quality = self._slot_quality(self.selected_slot_key, current_path) or {}
                 alternate_quality = self._slot_quality(self.selected_slot_key, alternate_path) or {}
                 alternate_candidate = self._candidate_for_slot_path(self.selected_slot_key, alternate_path) or {}
-                self.compare_summary_var.set(f"Comparing the current {slot_label} assignment against a ranked alternate.")
+                summary, hint = build_compare_guidance(
+                    COMPARE_MODE_CURRENT_VS_CANDIDATE,
+                    slot_label=slot_label,
+                    current_profile_label=self.current_build_profile.compare_label,
+                    current_quality=current_quality,
+                    selection_context=self._selection_context_for_slot(self.selected_slot_key, current_path),
+                    weak_hidpi=weak_hidpi,
+                    is_ambiguous=is_ambiguous,
+                    alternate_path=Path(alternate_path).name,
+                    alternate_rank=alternate_candidate.get("rank"),
+                    alternate_quality=alternate_quality,
+                )
+                self.compare_summary_var.set(summary)
                 self.compare_hint_var.set(
-                    f"Current: {Path(current_path).name} [{current_quality.get('label', '--')}]. "
+                    f"{hint} Current: {Path(current_path).name} [{current_quality.get('label', '--')}]. "
                     f"Alternate: {Path(alternate_path).name} [rank #{alternate_candidate.get('rank', '--')}, "
                     f"{alternate_quality.get('label', '--')}]."
                 )
@@ -3410,16 +3538,24 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                 )
                 self._render_preview_payload_into_panel(self.compare_left_panel, left_payload, PLAYER_PREVIEW_SIZE)
                 self._render_preview_payload_into_panel(self.compare_right_panel, right_payload, PLAYER_PREVIEW_SIZE)
-                self.compare_summary_var.set(f"Comparing source timing and art against the predicted Linux output for {slot_label}.")
-                self.compare_hint_var.set(
-                    "Use this view to catch upscale softness, non-square output behavior, timing changes, and hotspot issues before export."
+                current_quality = self._slot_quality(self.selected_slot_key, current_path)
+                summary, hint = build_compare_guidance(
+                    COMPARE_MODE_SOURCE_VS_OUTPUT,
+                    slot_label=slot_label,
+                    current_profile_label=self.current_build_profile.compare_label,
+                    current_quality=current_quality,
+                    selection_context=self._selection_context_for_slot(self.selected_slot_key, current_path),
+                    weak_hidpi=weak_hidpi,
+                    is_ambiguous=is_ambiguous,
                 )
+                self.compare_summary_var.set(summary)
+                self.compare_hint_var.set(hint)
                 return
 
             compare_preset = resolve_build_preset(self.compare_preset_var.get().strip() or SAFE_PRESET_LABEL)
             current_sizes = self.try_target_sizes()[0]
             current_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
-            self.compare_left_panel.set_title(f"Current Build ({self.build_preset_var.get() or 'Custom'})")
+            self.compare_left_panel.set_title(f"Current Build ({self.current_build_profile.compare_label})")
             self.compare_right_panel.set_title(f"Compare Preset ({compare_preset['label']})")
             left_payload = self._prepare_custom_output_preview_payload(source_path, current_sizes, current_filter)
             right_payload = self._prepare_custom_output_preview_payload(
@@ -3444,13 +3580,19 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                 self.pack_analysis,
                 selection_context=self._selection_context_for_slot(self.selected_slot_key, current_path),
             )
-            self.compare_summary_var.set(
-                f"Comparing current build settings against {compare_preset['label']} for {slot_label}."
+            summary, hint = build_compare_guidance(
+                COMPARE_MODE_PRESET,
+                slot_label=slot_label,
+                current_profile_label=self.current_build_profile.compare_label,
+                current_quality=current_quality,
+                selection_context=self._selection_context_for_slot(self.selected_slot_key, current_path),
+                weak_hidpi=weak_hidpi,
+                is_ambiguous=is_ambiguous,
+                compare_preset_label=compare_preset["label"],
+                compare_preset_quality=preset_quality,
             )
-            self.compare_hint_var.set(
-                f"Current forecast: {current_quality['label']} ({current_quality['confidence']} confidence). "
-                f"{compare_preset['label']}: {preset_quality['label']} ({preset_quality['confidence']} confidence)."
-            )
+            self.compare_summary_var.set(summary)
+            self.compare_hint_var.set(hint)
         except Exception as exc:  # noqa: BLE001
             self.compare_summary_var.set("Unable to build the requested compare preview.")
             self.compare_hint_var.set(str(exc))
@@ -3506,15 +3648,6 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         self._update_busy_buttons()
         if status_message is not None:
             self.set_status(status_message)
-
-    def _sync_preset_from_settings(self) -> None:
-        sizes, _error = self.try_target_sizes()
-        current_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
-        for preset in BUILD_PRESETS:
-            if preset["target_sizes"] == sizes and preset["scale_filter"] == current_filter:
-                if self.build_preset_var.get() != preset["label"]:
-                    self.build_preset_var.set(preset["label"])
-                return
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -3898,7 +4031,14 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         finally:
             self._suspend_refresh_traces = False
         self._update_preview_size_choices()
-        self._sync_preset_from_settings()
+        self.profile_base_preset_label = restore_profile_base_preset(
+            payload.get("build_profile"),
+            self.target_sizes,
+            scale_filter,
+        )
+        if self.profile_base_preset_label:
+            self.build_preset_var.set(self.profile_base_preset_label)
+        self._refresh_build_profile_state()
 
         selected = payload.get("selected_slots", {})
         role_map = payload.get("resolved_role_map", {})
@@ -4001,6 +4141,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             target_sizes,
             self.scale_filter_var.get(),
             selection_context=self._selection_context_payload(),
+            build_profile=build_profile_payload(self.current_build_profile),
         )
         target = filedialog.asksaveasfilename(
             title="Save role mapping as JSON",
@@ -4057,7 +4198,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             self._render_slot_card(previous_slot)
         if slot_key in self.slot_cards:
             self._render_slot_card(slot_key)
-        self._refresh_selected_slot_detail()
+        self._schedule_selected_slot_detail_refresh()
 
     def focus_slot_candidates(self, slot_key: str) -> None:
         self.select_slot(slot_key)
@@ -4289,9 +4430,16 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                     self._render_selected_slot_text()
                 self._refresh_build_summary()
 
-            self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
+            self.task_runner.submit(
+                token,
+                work,
+                on_success=on_success,
+                on_error=on_error,
+                should_run=self.request_tracker.is_current,
+            )
 
     def _refresh_selected_slot_detail(self) -> None:
+        self.refresh_coalescer.cancel("selected-detail-refresh")
         slot = SLOT_BY_KEY[self.selected_slot_key]
         path = self._selected_slot_path()
         self.selected_slot_title_var.set(slot["label"])
@@ -4350,7 +4498,13 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                 return
             self.source_preview_panel.clear(str(exc))
 
-        self.task_runner.submit(token, source_work, on_success=source_success, on_error=source_error)
+        self.task_runner.submit(
+            token,
+            source_work,
+            on_success=source_success,
+            on_error=source_error,
+            should_run=self.request_tracker.is_current,
+        )
 
         def output_work(
             source_path: Path = source_path,
@@ -4383,7 +4537,13 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                 return
             self.output_preview_panel.clear(str(exc))
 
-        self.task_runner.submit(token, output_work, on_success=output_success, on_error=output_error)
+        self.task_runner.submit(
+            token,
+            output_work,
+            on_success=output_success,
+            on_error=output_error,
+            should_run=self.request_tracker.is_current,
+        )
 
     def _render_selected_slot_text(self) -> None:
         slot = SLOT_BY_KEY[self.selected_slot_key]
@@ -4478,6 +4638,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         return {candidate["path"]: candidate for candidate in candidates}
 
     def _refresh_candidate_detail(self) -> None:
+        self.refresh_coalescer.cancel("candidate-detail-refresh")
         selection = self.candidate_tree.selection()
         if not selection or selection[0] == "__none__":
             self.request_tracker.invalidate("candidate-preview")
@@ -4498,7 +4659,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             else:
                 set_readonly_text(self.current_choice_text, "Auto-fill or assign a slot to explain the active choice.")
             self.candidate_preview_panel.clear("No candidate selected")
-            self._refresh_compare_view()
+            self._schedule_compare_view_refresh()
             return
         candidate_path = selection[0]
         self.selected_candidate_path = candidate_path
@@ -4576,7 +4737,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             else:
                 set_readonly_text(self.current_choice_text, "Assign the slot first to compare the active choice against this candidate.")
             self._apply_preview_panel_payload(self.candidate_preview_panel, payload)
-            self._refresh_compare_view()
+            self._schedule_compare_view_refresh()
 
         def on_error(
             result_token: TaskToken,
@@ -4603,9 +4764,15 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             else:
                 set_readonly_text(self.current_choice_text, "Current-choice provenance is unavailable right now.")
             self.candidate_preview_panel.clear(str(exc))
-            self._refresh_compare_view()
+            self._schedule_compare_view_refresh()
 
-        self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
+        self.task_runner.submit(
+            token,
+            work,
+            on_success=on_success,
+            on_error=on_error,
+            should_run=self.request_tracker.is_current,
+        )
 
     def _refresh_build_summary(self) -> None:
         sizes, size_error = self.try_target_sizes()
@@ -4618,10 +4785,8 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         else:
             mapping_error = None
 
-        quality_labels = []
-        warning_lines = []
         pending_slots = []
-        quality_entries: list[tuple[dict, dict]] = []
+        quality_entries: list[tuple[dict, dict, dict | None]] = []
         for slot in SLOT_DEFS:
             path = self.slot_paths.get(slot["key"], "").strip()
             if not path:
@@ -4631,123 +4796,62 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
                 pending_slots.append(slot["label"])
                 continue
             if state.error:
-                quality_labels.append("redraw recommended")
-                warning_lines.append(f"- {slot['label']}: {state.error}")
+                quality_entries.append(
+                    (
+                        slot,
+                        {
+                            "label": "redraw recommended",
+                            "confidence": "low",
+                            "decision": "reduce preset or replace art",
+                            "warnings": [state.error],
+                            "actions": [state.error],
+                        },
+                        self._selection_context_for_slot(slot["key"], path),
+                    )
+                )
                 continue
             quality = state.quality
             if quality is None:
                 pending_slots.append(slot["label"])
                 continue
-            quality_entries.append((slot, quality))
-            quality_labels.append(quality["label"])
-            for warning in quality.get("warnings", [])[:2]:
-                warning_lines.append(f"- {slot['label']}: {warning}")
+            quality_entries.append((slot, quality, self._selection_context_for_slot(slot["key"], path)))
 
-        if mapping_error:
-            self.overall_quality_var.set("Overall quality forecast: configuration error")
-            warning_lines.insert(0, f"- Mapping error: {mapping_error}")
-        elif not quality_labels and pending_slots:
-            self.overall_quality_var.set(f"Overall quality forecast: loading slot analysis ({len(pending_slots)} pending)")
-        elif not quality_labels:
-            self.overall_quality_var.set("Overall quality forecast: no source slots assigned")
-        else:
-            avg_score = sum(quality_to_score(label) for label in quality_labels) / len(quality_labels)
-            if avg_score >= 3.5:
-                overall = "excellent"
-            elif avg_score >= 2.6:
-                overall = "good"
-            elif avg_score >= 1.8:
-                overall = "acceptable"
-            elif avg_score >= 1.0:
-                overall = "likely blurry"
-            else:
-                overall = "redraw recommended"
-            low_confidence_count = sum(1 for _slot, quality in quality_entries if quality.get("confidence") == "low")
-            confidence = "low" if low_confidence_count >= max(1, len(quality_entries) // 3) else "medium"
-            if low_confidence_count == 0 and quality_entries and all(
-                quality.get("confidence") == "high" for _slot, quality in quality_entries
-            ):
-                confidence = "high"
-            suffix = f" | {len(pending_slots)} slot(s) still preparing" if pending_slots else ""
-            self.overall_quality_var.set(
-                f"Overall quality forecast: {overall} ({confidence} confidence) | "
-                f"{len(selected_slots)} slot(s) assigned | {len(resolved)} Linux roles resolved{suffix}"
-            )
-
-        at_risk = [
-            (slot, quality)
-            for slot, quality in quality_entries
-            if quality["label"] in LOW_CONFIDENCE_LABELS or quality.get("confidence") == "low"
-        ]
-        redraw_queue = [
-            (slot, quality)
-            for slot, quality in quality_entries
-            if quality["label"] == "redraw recommended"
-        ]
-        suggested_preset = None
-        for _slot, quality in quality_entries:
-            if quality.get("suggested_preset"):
-                suggested_preset = quality["suggested_preset"]
-                break
-        if suggested_preset is None and self.pack_analysis is not None:
-            hidpi = self.pack_analysis.get("hidpi_potential", {})
-            if max(sizes or [0]) >= 96 and hidpi.get("rating") in {"weak", "limited"}:
-                suggested_preset = SAFE_PRESET_LABEL
-
-        if size_error:
-            warning_lines.insert(0, f"- Output sizes: {size_error}")
-        if pending_slots:
-            pending_preview = ", ".join(pending_slots[:4])
-            if len(pending_slots) > 4:
-                pending_preview += ", ..."
-            warning_lines.insert(0, f"- Preparing quality data for: {pending_preview}")
-        if self.pack_analysis is not None:
-            for warning in self.pack_analysis.get("warnings", []):
-                warning_lines.append(f"- Pack: {warning}")
-
-        guidance_lines = []
-        if suggested_preset:
-            guidance_lines.extend(
-                [
-                    "Preset guidance:",
-                    f"- {suggested_preset} is the safer baseline if you want less upscale-heavy output.",
-                    "",
-                ]
-            )
-        if at_risk:
-            guidance_lines.append("Slots to review before export:")
-            for slot, quality in at_risk[:8]:
-                guidance_lines.append(
-                    f"- {slot['label']}: {quality['label']} ({quality.get('confidence', 'low')} confidence) | {quality['decision']}"
-                )
-            guidance_lines.append("")
-        if redraw_queue:
-            guidance_lines.append("Manual replacement / redraw queue:")
-            for slot, quality in redraw_queue[:6]:
-                action = quality.get("actions", ["Manual replacement recommended."])[0]
-                guidance_lines.append(f"- {slot['label']}: {action}")
-            guidance_lines.append("")
-        if warning_lines:
-            guidance_lines.append("Warnings:")
-            guidance_lines.extend(dict.fromkeys(warning_lines))
-
-        set_readonly_text(self.build_warning_text, "\n".join(guidance_lines) or "No major warnings.")
-
-        try:
-            preset = resolve_build_preset(self.build_preset_var.get().strip())
-            preset_label = preset["label"]
-        except KeyError:
-            preset_label = self.build_preset_var.get().strip() or "--"
+        snapshot = build_readiness_snapshot(
+            quality_entries=quality_entries,
+            pending_slots=pending_slots,
+            selected_slot_count=len(selected_slots),
+            resolved_role_count=len(resolved),
+            target_sizes=sizes,
+            size_error=size_error,
+            mapping_error=mapping_error,
+            pack_analysis=self.pack_analysis,
+            safe_preset_label=SAFE_PRESET_LABEL,
+        )
+        self.overall_quality_var.set(snapshot.overall_quality_text)
+        self.readiness_var.set(snapshot.readiness_headline)
+        self.readiness_detail_var.set(
+            f"{snapshot.readiness_detail} | Forecast: {snapshot.overall_quality_text.removeprefix('Overall quality forecast: ')}"
+        )
+        self.review_queue_var.set(snapshot.review_queue_headline)
+        self.review_queue_hint_var.set(snapshot.review_queue_hint)
+        set_readonly_text(self.build_warning_text, snapshot.guidance_text)
 
         build_summary_lines = [
             f"Theme name: {self.theme_name_var.get().strip() or 'Custom-cursor'}",
-            f"Build preset: {preset_label}",
+            f"Build profile: {self.current_build_profile.label}",
+            f"Profile detail: {self.current_build_profile.detail}",
             f"Output root: {self.work_root_var.get().strip() or DEFAULT_WORK_ROOT}",
             f"Target sizes: {format_cursor_sizes(sizes)}",
             f"Scale filter: {self.scale_filter_var.get()}",
+            f"Readiness: {snapshot.readiness_headline.removeprefix('Pack readiness: ')}",
+            f"Workflow summary: {snapshot.readiness_detail}",
         ]
-        if suggested_preset:
-            build_summary_lines.append(f"Suggested safer preset: {suggested_preset}")
+        if snapshot.suggested_preset:
+            build_summary_lines.append(f"Suggested safer preset: {snapshot.suggested_preset}")
+        if mapping_error:
+            build_summary_lines.append(f"Mapping error: {mapping_error}")
+        if size_error:
+            build_summary_lines.append(f"Output size warning: {size_error}")
         build_summary_lines.extend(["", "Selected slots:"])
         if selected_slots:
             for item in sorted(selected_slots.values(), key=lambda item: item["slot"]["label"]):
@@ -4763,7 +4867,8 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
         set_readonly_text(self.build_summary_text, "\n".join(build_summary_lines))
 
     def _refresh_all_views(self) -> None:
-        self._sync_preset_from_settings()
+        self._cancel_scheduled_refreshes()
+        self._refresh_build_profile_state()
         self._update_preview_size_choices()
         self._render_pack_analysis()
         self._refresh_slot_cards()
@@ -4790,12 +4895,11 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
     def _on_preview_size_changed(self) -> None:
         if self._suspend_refresh_traces:
             return
-        self._refresh_selected_slot_detail()
+        self._schedule_preview_size_refresh()
 
     def on_build_settings_changed(self) -> None:
-        self._update_preview_size_choices()
-        self.output_preview_cache.clear()
-        self._refresh_all_views()
+        self._refresh_build_profile_state()
+        self._schedule_build_settings_refresh()
 
     def apply_selected_preset(self) -> None:
         preset = resolve_build_preset(self.build_preset_var.get())
@@ -4808,6 +4912,8 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             self.preview_nominal_size_var.set(str(self._default_preview_size(preset["target_sizes"])))
         finally:
             self._suspend_refresh_traces = False
+        self.profile_base_preset_label = preset["label"]
+        self._refresh_build_profile_state()
         self.set_status(f"Applied preset: {preset['label']}")
         self._refresh_all_views()
 
