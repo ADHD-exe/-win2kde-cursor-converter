@@ -393,20 +393,36 @@ def flatten_name(name: str) -> str:
     return "".join(normalized_tokens(name))
 
 
-def score_slot_match(name: str, slot: dict) -> int:
+def explain_slot_match(name: str, slot: dict) -> dict:
     tokens = normalized_tokens(name)
     flat = flatten_name(name)
     score = 0
+    matched_keywords = []
+    partial_keywords = []
+    matched_label_tokens = []
 
     for keyword in slot.get("keywords", ()):
         keyword_flat = flatten_name(keyword)
         if keyword in tokens:
             score += 5
+            matched_keywords.append(keyword)
         elif keyword_flat and keyword_flat in flat:
             score += 3
+            partial_keywords.append(keyword)
 
     for token in normalized_tokens(slot["label"]):
         if token in tokens:
             score += 2
+            matched_label_tokens.append(token)
 
-    return score
+    return {
+        "score": score,
+        "tokens": tokens,
+        "matched_keywords": matched_keywords,
+        "partial_keywords": partial_keywords,
+        "matched_label_tokens": matched_label_tokens,
+    }
+
+
+def score_slot_match(name: str, slot: dict) -> int:
+    return int(explain_slot_match(name, slot)["score"])

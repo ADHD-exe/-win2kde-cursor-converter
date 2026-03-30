@@ -11,7 +11,9 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -24,7 +26,20 @@ from build_from_slot_mapping import (
     load_source_metadata,
     prepare_output_preview_metadata,
 )
-from xcursor_builder import choose_best_entry, file_cache_token
+from preview_cache import (
+    BoundedCache,
+    MAX_OUTPUT_PREVIEW_DIRS,
+    MAX_PREVIEW_THUMB_FILES,
+    MAX_SOURCE_CACHE_DIRS,
+    cache_artifact_dir,
+    file_identity,
+    normalize_path,
+    prune_cache_dir,
+    source_cache_identity,
+    touch_cache_path,
+)
+from gui_task_runner import GuiTaskRunner, RequestTracker, TaskToken
+from xcursor_builder import choose_best_entry
 from prepare_windows_cursor_set import analyze_cursor_pack, prepare_windows_cursor_set
 from slot_definitions import (
     BUILD_PRESETS,
@@ -51,6 +66,15 @@ PLAYER_PREVIEW_SIZE = 132
 CANDIDATE_PREVIEW_SIZE = 96
 CANVAS_SLOT_GLYPH_SIZE = 28
 LOW_CONFIDENCE_LABELS = {"likely blurry", "redraw recommended"}
+COMPARE_MODE_CURRENT_VS_CANDIDATE = "Current vs Candidate"
+COMPARE_MODE_SOURCE_VS_OUTPUT = "Source vs Linux Output"
+COMPARE_MODE_PRESET = "Current Build vs Compare Preset"
+COMPARE_MODE_CHOICES = (
+    COMPARE_MODE_CURRENT_VS_CANDIDATE,
+    COMPARE_MODE_SOURCE_VS_OUTPUT,
+    COMPARE_MODE_PRESET,
+)
+SAFE_PRESET_LABEL = "Standard Linux"
 HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})$")
 DEFAULT_GUI_PALETTE = {
     "root_bg": "#2a2e32",
@@ -101,9 +125,10 @@ def build_payload(
     resolved: dict,
     target_sizes: list[int] | None = None,
     scale_filter: str = DEFAULT_SCALE_FILTER,
+    selection_context: dict | None = None,
 ) -> dict:
     sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
-    return {
+    payload = {
         "mapping_format_version": 2,
         "build_options": {
             "target_sizes": sizes,
@@ -119,6 +144,9 @@ def build_payload(
         },
         "resolved_role_map": resolved,
     }
+    if selection_context:
+        payload["selection_context"] = selection_context
+    return payload
 
 
 def load_mapping_payload(mapping_path: Path) -> dict:
@@ -239,14 +267,18 @@ def find_image_tool() -> str:
 
 def render_preview_thumbnail(source_png: Path, preview_root: Path, box_size: int) -> Path:
     preview_root.mkdir(parents=True, exist_ok=True)
+    resolved_source, source_token = file_identity(source_png)
     digest = hashlib.sha256(
-        f"{source_png.resolve()}::{file_cache_token(source_png)}::{box_size}".encode("utf-8")
+        f"{resolved_source}::{source_token}::{box_size}".encode("utf-8")
     ).hexdigest()[:12]
     preview_png = preview_root / f"{sanitize_path_component(source_png.stem)}_{digest}_{box_size}.png"
     if preview_png.exists():
+        touch_cache_path(preview_png)
+        prune_cache_dir(preview_root, MAX_PREVIEW_THUMB_FILES)
         return preview_png
 
     image_tool = find_image_tool()
+    temp_preview_png = preview_png.with_name(f"{preview_png.name}.tmp-{threading.get_ident()}")
     subprocess.run(
         [
             image_tool,
@@ -259,12 +291,15 @@ def render_preview_thumbnail(source_png: Path, preview_root: Path, box_size: int
             f"{box_size}x{box_size}",
             "-extent",
             f"{box_size}x{box_size}",
-            str(preview_png),
+            str(temp_preview_png),
         ],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    temp_preview_png.replace(preview_png)
+    touch_cache_path(preview_png)
+    prune_cache_dir(preview_root, MAX_PREVIEW_THUMB_FILES)
     return preview_png
 
 
@@ -307,6 +342,7 @@ def summarize_metadata(source_path: Path, metadata: dict) -> dict:
             hotspot_pairs.add((int(entry.get("hotspot_x", 0)), int(entry.get("hotspot_y", 0))))
             entry_count += 1
     largest_native_size = max((max(width, height) for width, height in size_pairs), default=0)
+    largest_native_area = max((width * height for width, height in size_pairs), default=0)
     size_summary = " / ".join(str(size) for size in sorted({max(width, height) for width, height in size_pairs})) or "--"
     return {
         "path": str(source_path),
@@ -318,9 +354,16 @@ def summarize_metadata(source_path: Path, metadata: dict) -> dict:
         "entry_count": entry_count,
         "delay_ms_total": sum(int(frame.get("delay_ms", 50)) for frame in frames),
         "largest_native_size": largest_native_size,
+        "largest_native_area": largest_native_area,
+        "native_sizes": [
+            {"width": width, "height": height}
+            for width, height in sorted(size_pairs)
+        ],
         "size_summary": size_summary,
         "contains_non_square": any(width != height for width, height in size_pairs),
         "hotspot_summary": ", ".join(f"{x},{y}" for x, y in sorted(hotspot_pairs)[:3]) or "--",
+        "low_priority_hits": [],
+        "duplicate_basename_count": 0,
         "warnings": [],
     }
 
@@ -363,25 +406,117 @@ def compact_path(path: str, max_len: int = 78) -> str:
     return "..." + path[-(max_len - 3) :]
 
 
-def score_quality(summary: dict, target_sizes: list[int]) -> tuple[str, str]:
-    if summary.get("error"):
-        return "redraw recommended", "The source metadata could not be inspected cleanly."
-    if not target_sizes:
-        return "acceptable", "No target sizes are configured yet."
-    max_target = max(target_sizes)
-    max_native = int(summary.get("largest_native_size", 0))
-    if max_native >= max_target:
-        return "excellent", "The source already reaches the largest requested output size."
-    if max_native >= int(max_target * 0.75):
-        return "good", "Only moderate upscale is required for the largest output size."
-    if max_native >= int(max_target * 0.5):
-        return "acceptable", "The source can scale up, but larger sizes may soften."
-    if max_native >= int(max_target * 0.33):
-        return "likely blurry", "Large output sizes are substantially above the native source detail."
-    return "redraw recommended", "The selected source is far below the requested build sizes."
+def native_nominal_sizes(summary: dict) -> list[int]:
+    native_sizes = summary.get("native_sizes", [])
+    values = sorted(
+        {
+            max(int(item["width"]), int(item["height"]))
+            for item in native_sizes
+            if isinstance(item, dict) and item.get("width") and item.get("height")
+        }
+    )
+    if values:
+        return values
+    size_summary = str(summary.get("size_summary", "")).strip()
+    if not size_summary or size_summary == "--":
+        return []
+    parsed = []
+    for part in size_summary.split("/"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed.append(int(part))
+        except ValueError:
+            continue
+    return sorted(set(parsed))
 
 
-def infer_slot_warnings(slot_key: str, summary: dict, target_sizes: list[int], pack_analysis: dict | None) -> list[str]:
+def quality_label_from_numeric(score: float) -> str:
+    if score >= 3.55:
+        return "excellent"
+    if score >= 2.75:
+        return "good"
+    if score >= 1.95:
+        return "acceptable"
+    if score >= 1.0:
+        return "likely blurry"
+    return "redraw recommended"
+
+
+def confidence_label(score: int) -> str:
+    if score >= 3:
+        return "high"
+    if score >= 1:
+        return "medium"
+    return "low"
+
+
+def recommended_redraw_master_size(target_sizes: list[int]) -> int:
+    sizes = sorted(int(size) for size in target_sizes if int(size) > 0)
+    if not sizes:
+        return 64
+    max_target = max(sizes)
+    if max_target >= 192:
+        return 128
+    if max_target >= 128:
+        return 128
+    if max_target >= 96:
+        return 96
+    return max(64, max_target)
+
+
+def summarize_match_details(match_details: dict) -> str:
+    keywords = list(match_details.get("matched_keywords", []))
+    partials = list(match_details.get("partial_keywords", []))
+    label_tokens = list(match_details.get("matched_label_tokens", []))
+    parts = []
+    if keywords:
+        parts.append("keyword hit: " + ", ".join(keywords))
+    if partials:
+        parts.append("partial name hit: " + ", ".join(partials))
+    if label_tokens:
+        parts.append("slot-label token hit: " + ", ".join(label_tokens))
+    return "; ".join(parts) or "filename heuristic only"
+
+
+def candidate_rank_gap_reason(candidate: dict, leader: dict | None) -> str:
+    if leader is None or candidate.get("path") == leader.get("path"):
+        return "top-ranked candidate"
+
+    candidate_score = int(candidate.get("score", 0))
+    leader_score = int(leader.get("score", 0))
+    if candidate_score != leader_score:
+        return f"score trails the leader by {leader_score - candidate_score} point(s)"
+
+    candidate_low_priority = int(candidate.get("low_priority_hits", 0))
+    leader_low_priority = int(leader.get("low_priority_hits", 0))
+    if candidate_low_priority != leader_low_priority:
+        return "same filename score, but folder priority is worse"
+
+    candidate_depth = int(candidate.get("depth", 0))
+    leader_depth = int(leader.get("depth", 0))
+    if candidate_depth != leader_depth:
+        return "same score, but it lives deeper in the pack"
+
+    candidate_size = int(candidate.get("largest_native_size", 0))
+    leader_size = int(leader.get("largest_native_size", 0))
+    if candidate_size != leader_size:
+        if candidate_size < leader_size:
+            return "same score, but it offers less native detail"
+        return "same score, but it only wins on filename/path ordering"
+
+    return "same score, but it sorts lower after path-priority tie-breaks"
+
+
+def infer_slot_warnings(
+    slot_key: str,
+    summary: dict,
+    target_sizes: list[int],
+    pack_analysis: dict | None = None,
+    *,
+    ambiguous_candidates: list[dict] | None = None,
+) -> list[str]:
     warnings = list(summary.get("warnings", []))
     if summary.get("error"):
         warnings.append(summary["error"])
@@ -395,6 +530,11 @@ def infer_slot_warnings(slot_key: str, summary: dict, target_sizes: list[int], p
         warnings.append("source detail is small for modern HiDPI cursor sizes")
     if summary.get("contains_non_square"):
         warnings.append("contains non-square native art; review the predicted Linux preview")
+    if summary.get("low_priority_hits"):
+        hits = ", ".join(sorted(set(summary["low_priority_hits"])))
+        warnings.append(f"candidate is stored under generated/temp folders: {hits}")
+    if int(summary.get("duplicate_basename_count", 0)) > 1:
+        warnings.append("same filename appears elsewhere in the pack; confirm you picked the right copy")
 
     stem = Path(summary["filename"]).stem
     if slot_key == "default_pointer":
@@ -403,13 +543,18 @@ def infer_slot_warnings(slot_key: str, summary: dict, target_sizes: list[int], p
         if progress_score >= default_score and progress_score > 0:
             warnings.append("this default pointer name also looks like a progress/appstart cursor")
 
-    if pack_analysis is not None:
+    ambiguous = ambiguous_candidates
+    if ambiguous is None and pack_analysis is not None:
         ambiguous = pack_analysis.get("ambiguous_candidates", {}).get(slot_key, [])
-        if ambiguous:
-            selected_path = summary["path"]
-            top_paths = {candidate["path"] for candidate in ambiguous}
-            if selected_path in top_paths:
-                warnings.append("slot choice is ambiguous based on filename heuristics alone")
+    if ambiguous:
+        selected_path = summary["path"]
+        top_paths = {candidate["path"] for candidate in ambiguous}
+        if selected_path in top_paths:
+            warnings.append("slot choice is ambiguous based on filename heuristics alone")
+    if pack_analysis is not None:
+        hidpi = pack_analysis.get("hidpi_potential", {})
+        if max_target >= 96 and hidpi.get("rating") in {"weak", "limited"}:
+            warnings.append("pack-level HiDPI coverage is weak; smaller presets may be safer than pure conversion")
     return list(dict.fromkeys(warnings))
 
 
@@ -421,12 +566,161 @@ def build_slot_card_subtitle(summary: dict) -> str:
     return f"{animated} | {source_type} | {size_summary} | hotspot {hotspot_summary}"
 
 
+def evaluate_quality_forecast(
+    slot_key: str,
+    summary: dict,
+    target_sizes: list[int],
+    pack_analysis: dict | None = None,
+    candidate: dict | None = None,
+    selection_context: dict | None = None,
+) -> dict:
+    if summary.get("error"):
+        return {
+            "label": "redraw recommended",
+            "confidence": "low",
+            "reason": "The source metadata could not be inspected cleanly.",
+            "warnings": [summary["error"]],
+            "actions": ["Inspect or replace the source asset before building."],
+            "decision": "manual replacement required",
+            "suggested_preset": SAFE_PRESET_LABEL,
+        }
+    if not target_sizes:
+        return {
+            "label": "acceptable",
+            "confidence": "low",
+            "reason": "No target sizes are configured yet.",
+            "warnings": infer_slot_warnings(slot_key, summary, target_sizes, pack_analysis),
+            "actions": ["Pick output sizes before trusting the forecast."],
+            "decision": "configure build sizes first",
+            "suggested_preset": None,
+        }
+
+    native_sizes = native_nominal_sizes(summary)
+    max_target = max(target_sizes)
+    max_native = int(summary.get("largest_native_size", 0))
+    coverage_ratio = (max_native / max_target) if max_target else 1.0
+    exact_hits = sum(1 for size in target_sizes if size in native_sizes)
+    near_hits = sum(
+        1
+        for size in target_sizes
+        if any(abs(native - size) <= max(2, int(size * 0.18)) for native in native_sizes)
+    )
+    scaled_sizes = [size for size in target_sizes if size > max_native]
+
+    numeric_score = 0.0
+    if coverage_ratio >= 1.0:
+        numeric_score = 3.85
+    elif coverage_ratio >= 0.85:
+        numeric_score = 3.15
+    elif coverage_ratio >= 0.65:
+        numeric_score = 2.35
+    elif coverage_ratio >= 0.45:
+        numeric_score = 1.45
+    else:
+        numeric_score = 0.55
+
+    if exact_hits:
+        numeric_score += min(0.35, exact_hits * 0.08)
+    elif near_hits:
+        numeric_score += min(0.2, near_hits * 0.04)
+
+    if len(native_sizes) <= 1 and len(target_sizes) >= 4:
+        numeric_score -= 0.2
+    if summary.get("contains_non_square"):
+        numeric_score -= 0.12
+    if summary.get("low_priority_hits"):
+        numeric_score -= 0.18
+
+    ambiguous = False
+    if pack_analysis is not None:
+        top_paths = {item["path"] for item in pack_analysis.get("ambiguous_candidates", {}).get(slot_key, [])}
+        ambiguous = summary.get("path") in top_paths
+        if ambiguous:
+            numeric_score -= 0.2
+
+    numeric_score = max(0.0, min(4.0, numeric_score))
+    label = quality_label_from_numeric(numeric_score)
+
+    confidence_score = 2
+    if native_sizes:
+        confidence_score += 1
+    if exact_hits == 0 and near_hits == 0:
+        confidence_score -= 1
+    if ambiguous:
+        confidence_score -= 1
+    if summary.get("low_priority_hits"):
+        confidence_score -= 1
+    if candidate is not None and int(candidate.get("rank", 1) or 1) > 3:
+        confidence_score -= 1
+    confidence = confidence_label(confidence_score)
+
+    if label == "excellent":
+        reason = f"Native detail already reaches {max_native}px, so the requested ceiling is covered without upscale."
+        decision = "build-ready"
+    elif label == "good":
+        reason = f"Largest native detail is {max_native}px; only moderate upscale remains for the biggest outputs."
+        decision = "build-ready with review"
+    elif label == "acceptable":
+        scaled_text = ", ".join(str(size) for size in scaled_sizes[:3]) or str(max_target)
+        reason = f"Smaller outputs are well-covered, but {scaled_text}px output will rely on visible scaling."
+        decision = "compare before export"
+    elif label == "likely blurry":
+        reason = f"Most requested sizes outrun the {max_native}px source detail, so softness is likely at larger sizes."
+        decision = "reduce preset or replace art"
+    else:
+        reason = f"Requested {max_target}px output is far beyond the available {max_native}px native detail."
+        decision = "manual replacement required"
+
+    warnings = infer_slot_warnings(slot_key, summary, target_sizes, pack_analysis)
+    actions = []
+    if ambiguous:
+        actions.append("Compare the current choice against the next-ranked candidate before building.")
+    if summary.get("low_priority_hits"):
+        actions.append("Prefer the non-generated/root-level source if the visual compare looks equivalent.")
+    if label in {"likely blurry", "redraw recommended"} and max_target >= 96:
+        actions.append("Try Standard Linux or a smaller custom size set if you want to avoid large upscale.")
+    if label == "redraw recommended":
+        actions.append(
+            f"Manual replacement/redraw is the safer path; aim for at least {recommended_redraw_master_size(target_sizes)}px source art."
+        )
+    elif label == "likely blurry":
+        actions.append("Inspect the predicted Linux preview and decide whether softness is acceptable for this slot.")
+    if summary.get("contains_non_square"):
+        actions.append("Verify hotspot placement in the predicted Linux output before export.")
+    if selection_context and selection_context.get("origin") == "fallback":
+        actions.append("This slot currently reuses art from another role; replace it if that reuse looks wrong in context.")
+    if not actions:
+        actions.append("No immediate action needed beyond normal visual review.")
+
+    suggested_preset = SAFE_PRESET_LABEL if (max_target >= 96 and max_native < 96) else None
+    return {
+        "label": label,
+        "confidence": confidence,
+        "reason": reason,
+        "warnings": warnings,
+        "actions": list(dict.fromkeys(actions)),
+        "decision": decision,
+        "suggested_preset": suggested_preset,
+        "native_sizes": native_sizes,
+        "coverage_ratio": coverage_ratio,
+        "exact_hits": exact_hits,
+        "near_hits": near_hits,
+        "scaled_sizes": scaled_sizes,
+    }
+
+
+def score_quality(summary: dict, target_sizes: list[int]) -> tuple[str, str]:
+    forecast = evaluate_quality_forecast("default_pointer", summary, target_sizes)
+    return forecast["label"], forecast["reason"]
+
+
 def inspect_animation_behavior(frames: list[dict]) -> dict:
     if not frames:
         return {
             "stats": "No frame timing available",
             "timeline": "",
             "warnings": [],
+            "frame_rows": [],
         }
 
     delays = [max(1, int(frame.get("delay_ms", 50))) for frame in frames]
@@ -434,6 +728,8 @@ def inspect_animation_behavior(frames: list[dict]) -> dict:
     min_delay = min(delays)
     max_delay = max(delays)
     avg_delay = total_ms / len(delays)
+    size_pairs = {(int(frame.get("width", 0)), int(frame.get("height", 0))) for frame in frames}
+    hotspot_pairs = {(int(frame.get("hotspot_x", 0)), int(frame.get("hotspot_y", 0))) for frame in frames}
     if len(frames) <= 1:
         pacing = "static"
     elif avg_delay <= 45:
@@ -454,15 +750,395 @@ def inspect_animation_behavior(frames: list[dict]) -> dict:
         warnings.append("long animation sequence; inspect pacing before export")
     if any(int(frame.get("width", 0)) != int(frame.get("height", 0)) for frame in frames):
         warnings.append("contains non-square frames; verify the Linux output preview")
+    if len(size_pairs) > 1:
+        warnings.append("frame dimensions change across the loop and may cause visible jitter")
+    if len(hotspot_pairs) > 1:
+        warnings.append("hotspots move between frames; confirm the motion is intentional")
 
     timeline = " | ".join(f"{index + 1}:{delay}ms" for index, delay in enumerate(delays[:8]))
     if len(delays) > 8:
         timeline += " | ..."
 
+    elapsed = 0
+    frame_rows = []
+    for index, frame in enumerate(frames, start=1):
+        delay = max(1, int(frame.get("delay_ms", 50)))
+        width = int(frame.get("width", 0))
+        height = int(frame.get("height", 0))
+        note_parts = []
+        if delay == min_delay and len(frames) > 1:
+            note_parts.append("fastest")
+        if delay == max_delay and len(frames) > 1 and max_delay != min_delay:
+            note_parts.append("longest hold")
+        if width != height:
+            note_parts.append("non-square")
+        frame_rows.append(
+            {
+                "index": index,
+                "delay_ms": delay,
+                "start_ms": elapsed,
+                "size": f"{width}x{height}",
+                "hotspot": f"{int(frame.get('hotspot_x', 0))},{int(frame.get('hotspot_y', 0))}",
+                "note": ", ".join(note_parts),
+            }
+        )
+        elapsed += delay
+
     return {
-        "stats": f"Pacing: {pacing} | delay range {min_delay}-{max_delay}ms | loop {format_duration_ms(total_ms)}",
+        "stats": (
+            f"{len(frames)} frame(s) | loop {format_duration_ms(total_ms)} | pacing {pacing} | "
+            f"delay range {min_delay}-{max_delay}ms"
+        ),
         "timeline": f"Frame strip: {timeline}",
         "warnings": warnings,
+        "frame_rows": frame_rows,
+    }
+
+
+@dataclass(slots=True)
+class SlotRenderState:
+    path: str = ""
+    loading: bool = False
+    summary: dict | None = None
+    quality: dict | None = None
+    thumbnail_path: str | None = None
+    error: str | None = None
+
+
+def merge_pack_asset_summary(summary: dict, asset_summary: dict | None) -> dict:
+    if asset_summary is None:
+        return summary
+    merged = dict(summary)
+    merged["warnings"] = list(dict.fromkeys(asset_summary.get("warnings", [])))
+    merged["relative_path"] = asset_summary.get("relative_path", merged["relative_path"])
+    merged["source_type"] = asset_summary.get("source_type", merged["source_type"])
+    merged["largest_native_size"] = asset_summary.get("largest_native_size", merged["largest_native_size"])
+    merged["largest_native_area"] = asset_summary.get("largest_native_area", merged.get("largest_native_area", 0))
+    merged["native_sizes"] = list(asset_summary.get("native_sizes", merged.get("native_sizes", [])))
+    merged["size_summary"] = asset_summary.get("size_summary", merged["size_summary"])
+    merged["contains_non_square"] = asset_summary.get("contains_non_square", merged["contains_non_square"])
+    merged["low_priority_hits"] = list(asset_summary.get("low_priority_hits", merged.get("low_priority_hits", [])))
+    merged["duplicate_basename_count"] = asset_summary.get(
+        "duplicate_basename_count",
+        merged.get("duplicate_basename_count", 0),
+    )
+    return merged
+
+
+def source_metadata_cache_key_for(source_path: Path, preview_root: Path) -> tuple:
+    resolved_text, dependency_token = source_cache_identity(source_path)
+    return ("source-metadata", resolved_text, dependency_token, str(preview_root))
+
+
+def summary_cache_key_for(source_path: Path, preview_root: Path) -> tuple:
+    resolved_text, dependency_token = source_cache_identity(source_path)
+    return ("source-summary", resolved_text, dependency_token, str(preview_root))
+
+
+def output_preview_cache_key_for(
+    source_path: Path,
+    preview_root: Path,
+    sizes: list[int],
+    filter_name: str,
+    preview_nominal_size: int,
+) -> tuple:
+    resolved_text, dependency_token = source_cache_identity(source_path)
+    return (
+        "output-preview",
+        resolved_text,
+        dependency_token,
+        tuple(int(size) for size in sizes),
+        filter_name,
+        int(preview_nominal_size),
+        str(preview_root),
+    )
+
+
+def touch_source_preview_artifacts(preview_root: Path, source_path: Path) -> None:
+    if source_path.suffix.lower() in {".json", ".png"}:
+        return
+    source_cache_root = preview_root / "_source"
+    touch_cache_path(cache_artifact_dir(source_cache_root, source_path))
+    prune_cache_dir(source_cache_root, MAX_SOURCE_CACHE_DIRS)
+
+
+def touch_output_preview_artifacts(preview_root: Path, preview: dict) -> None:
+    output_cache_root = preview_root / "_output"
+    frame_dirs = {
+        str(Path(frame["png"]).expanduser().resolve().parent)
+        for frame in preview.get("frames", [])
+        if frame.get("png")
+    }
+    for frame_dir in frame_dirs:
+        touch_cache_path(Path(frame_dir))
+    prune_cache_dir(output_cache_root, MAX_OUTPUT_PREVIEW_DIRS)
+
+
+def load_cached_source_metadata(
+    source_path: Path,
+    preview_root: Path,
+    metadata_cache: BoundedCache[tuple, dict],
+) -> dict:
+    resolved = normalize_path(source_path)
+    cache_key = source_metadata_cache_key_for(resolved, preview_root)
+    cached = metadata_cache.get(cache_key)
+    if cached is not None:
+        touch_source_preview_artifacts(preview_root, resolved)
+        return cached
+    metadata = load_source_metadata(resolved, preview_root / "_source")
+    touch_source_preview_artifacts(preview_root, resolved)
+    return metadata_cache.set(cache_key, metadata)
+
+
+def load_cached_summary(
+    source_path: Path,
+    preview_root: Path,
+    metadata_cache: BoundedCache[tuple, dict],
+    summary_cache: BoundedCache[tuple, dict],
+    *,
+    asset_summary: dict | None = None,
+) -> dict:
+    resolved = normalize_path(source_path)
+    cache_key = summary_cache_key_for(resolved, preview_root)
+    cached = summary_cache.get(cache_key)
+    if cached is not None:
+        return merge_pack_asset_summary(cached, asset_summary)
+    metadata = load_cached_source_metadata(resolved, preview_root, metadata_cache)
+    summary = summarize_metadata(resolved, metadata)
+    stored_summary = summary_cache.set(cache_key, summary)
+    return merge_pack_asset_summary(stored_summary, asset_summary)
+
+
+def load_cached_output_preview(
+    source_path: Path,
+    preview_root: Path,
+    sizes: list[int],
+    filter_name: str,
+    preview_nominal_size: int,
+    metadata_cache: BoundedCache[tuple, dict],
+    output_cache: BoundedCache[tuple, dict],
+) -> dict:
+    resolved = normalize_path(source_path)
+    cache_key = output_preview_cache_key_for(resolved, preview_root, sizes, filter_name, preview_nominal_size)
+    cached = output_cache.get(cache_key)
+    if cached is not None:
+        touch_output_preview_artifacts(preview_root, cached)
+        return cached
+    preview = prepare_output_preview_metadata(
+        resolved,
+        preview_root / "_output",
+        sizes,
+        scale_filter=filter_name,
+        preview_nominal_size=preview_nominal_size,
+        source_metadata=load_cached_source_metadata(resolved, preview_root, metadata_cache),
+        source_cache_root=preview_root / "_source",
+    )
+    touch_output_preview_artifacts(preview_root, preview)
+    return output_cache.set(cache_key, preview)
+
+
+def build_slot_quality(
+    slot_key: str,
+    summary: dict,
+    target_sizes: list[int],
+    *,
+    pack_analysis: dict | None = None,
+    ambiguous_candidates: list[dict] | None = None,
+    selection_context: dict | None = None,
+) -> dict:
+    quality_pack_analysis = pack_analysis
+    if quality_pack_analysis is None and ambiguous_candidates is not None:
+        quality_pack_analysis = {"ambiguous_candidates": {slot_key: ambiguous_candidates}}
+    return evaluate_quality_forecast(
+        slot_key,
+        summary,
+        target_sizes,
+        pack_analysis=quality_pack_analysis,
+        selection_context=selection_context,
+    )
+
+
+def build_animation_preview_payload(
+    frames: list[dict],
+    preview_root: Path,
+    box_size: int,
+    *,
+    summary: str,
+    frame_info: str,
+) -> dict:
+    if not frames:
+        return {
+            "frames": [],
+            "thumbnail_paths": [],
+            "summary": "No preview available",
+            "frame_info": frame_info,
+            "inspection_text": "",
+            "warning_text": "",
+        }
+    thumbnail_paths = [
+        str(render_preview_thumbnail(Path(frame["png"]), preview_root / "_thumbs", box_size))
+        for frame in frames
+    ]
+    inspection = inspect_animation_behavior(frames)
+    inspection_parts = [inspection["stats"]]
+    if inspection["timeline"]:
+        inspection_parts.append(inspection["timeline"])
+    return {
+        "frames": frames,
+        "thumbnail_paths": thumbnail_paths,
+        "summary": summary,
+        "frame_info": frame_info,
+        "inspection_text": " | ".join(part for part in inspection_parts if part),
+        "warning_text": "; ".join(inspection["warnings"][:2]),
+    }
+
+
+def prepare_slot_card_payload(
+    source_path: Path,
+    preview_root: Path,
+    preview_nominal_size: int,
+    target_sizes: list[int],
+    slot_key: str,
+    metadata_cache: BoundedCache[tuple, dict],
+    summary_cache: BoundedCache[tuple, dict],
+    *,
+    pack_analysis: dict | None = None,
+    asset_summary: dict | None = None,
+    ambiguous_candidates: list[dict] | None = None,
+) -> dict:
+    summary = load_cached_summary(
+        source_path,
+        preview_root,
+        metadata_cache,
+        summary_cache,
+        asset_summary=asset_summary,
+    )
+    quality = build_slot_quality(
+        slot_key,
+        summary,
+        target_sizes,
+        pack_analysis=pack_analysis,
+        ambiguous_candidates=ambiguous_candidates,
+    )
+    metadata = load_cached_source_metadata(source_path, preview_root, metadata_cache)
+    frames = frames_from_source_metadata(metadata, preview_nominal_size)
+    thumbnail_path = None
+    if frames:
+        thumbnail_path = str(render_preview_thumbnail(Path(frames[0]["png"]), preview_root / "_thumbs", CARD_PREVIEW_SIZE))
+    return {
+        "summary": summary,
+        "quality": quality,
+        "thumbnail_path": thumbnail_path,
+    }
+
+
+def prepare_source_preview_payload(
+    source_path: Path,
+    preview_root: Path,
+    preview_nominal_size: int,
+    metadata_cache: BoundedCache[tuple, dict],
+) -> dict:
+    metadata = load_cached_source_metadata(source_path, preview_root, metadata_cache)
+    frames = frames_from_source_metadata(metadata, preview_nominal_size)
+    if not frames:
+        return {"reason": "No extracted frames available", "preview": None}
+    summary = (
+        f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))} total | "
+        f"using build-consistent native entries for {preview_nominal_size}px"
+    )
+    frame_info = f"Actual source timing preserved. First frame nominal size: {frames[0]['nominal_size']}px."
+    return {
+        "reason": None,
+        "preview": build_animation_preview_payload(
+            frames,
+            preview_root,
+            PLAYER_PREVIEW_SIZE,
+            summary=summary,
+            frame_info=frame_info,
+        ),
+    }
+
+
+def prepare_output_preview_payload(
+    source_path: Path,
+    preview_root: Path,
+    preview_nominal_size: int,
+    target_sizes: list[int],
+    scale_filter: str,
+    metadata_cache: BoundedCache[tuple, dict],
+    output_cache: BoundedCache[tuple, dict],
+) -> dict:
+    preview = load_cached_output_preview(
+        source_path,
+        preview_root,
+        target_sizes,
+        scale_filter,
+        preview_nominal_size,
+        metadata_cache,
+        output_cache,
+    )
+    frames = preview["frames"]
+    if not frames:
+        return {"reason": "No predicted frames available", "preview": None}
+    total_ms = sum(int(frame.get("delay_ms", 50)) for frame in frames)
+    first = frames[0]
+    frame_info = (
+        f"Nominal size {preview['preview_nominal_size']}px | emitted PNG {first['width']}x{first['height']} | "
+        f"filter {preview['scale_filter']}"
+    )
+    summary = f"{len(frames)} frame(s) | {format_duration_ms(total_ms)} total | built path preview"
+    return {
+        "reason": None,
+        "preview": build_animation_preview_payload(
+            frames,
+            preview_root,
+            PLAYER_PREVIEW_SIZE,
+            summary=summary,
+            frame_info=frame_info,
+        ),
+    }
+
+
+def prepare_candidate_preview_payload(
+    source_path: Path,
+    preview_root: Path,
+    preview_nominal_size: int,
+    target_sizes: list[int],
+    slot_key: str,
+    metadata_cache: BoundedCache[tuple, dict],
+    summary_cache: BoundedCache[tuple, dict],
+    *,
+    pack_analysis: dict | None = None,
+    asset_summary: dict | None = None,
+    ambiguous_candidates: list[dict] | None = None,
+) -> dict:
+    summary = load_cached_summary(
+        source_path,
+        preview_root,
+        metadata_cache,
+        summary_cache,
+        asset_summary=asset_summary,
+    )
+    quality = build_slot_quality(
+        slot_key,
+        summary,
+        target_sizes,
+        pack_analysis=pack_analysis,
+        ambiguous_candidates=ambiguous_candidates,
+    )
+    metadata = load_cached_source_metadata(source_path, preview_root, metadata_cache)
+    frames = frames_from_source_metadata(metadata, preview_nominal_size)
+    preview_payload = build_animation_preview_payload(
+        frames,
+        preview_root,
+        CANDIDATE_PREVIEW_SIZE,
+        summary=f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))}",
+        frame_info=f"Candidate path: {compact_path(str(normalize_path(source_path)), max_len=82)}",
+    )
+    return {
+        "summary": summary,
+        "quality": quality,
+        "preview": preview_payload,
     }
 
 
@@ -476,9 +1152,11 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         self.current_index = 0
         self.running = False
         self.after_id: str | None = None
+        self._strip_sync = False
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
+        self.rowconfigure(7, weight=1)
 
         self.canvas = tk.Canvas(
             self,
@@ -499,6 +1177,8 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         self.pause_button = ttk.Button(controls, text="Pause", command=self.pause)
         self.pause_button.grid(row=0, column=1, sticky="w")
         ttk.Button(controls, text="Replay", command=self.replay).grid(row=0, column=2, padx=(6, 6))
+        ttk.Button(controls, text="Prev", command=self.step_prev).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(controls, text="Next", command=self.step_next).grid(row=0, column=4, padx=(0, 6))
 
         self.speed_var = tk.StringVar(value="1.0x")
         self.speed_combo = ttk.Combobox(
@@ -508,7 +1188,7 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             state="readonly",
             width=6,
         )
-        self.speed_combo.grid(row=0, column=3, sticky="e")
+        self.speed_combo.grid(row=0, column=5, sticky="e")
         self.speed_combo.bind("<<ComboboxSelected>>", lambda _event: self._restart_if_running())
 
         self.summary_var = tk.StringVar(value="No preview loaded")
@@ -539,11 +1219,51 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             pady=(2, 0),
         )
 
+        self.playhead_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.playhead_var, justify="left", wraplength=canvas_size + 40, style="Muted.TLabel").grid(
+            row=6,
+            column=0,
+            sticky="w",
+            pady=(2, 0),
+        )
+
+        strip_frame = ttk.Frame(self)
+        strip_frame.grid(row=7, column=0, sticky="nsew", pady=(8, 0))
+        strip_frame.columnconfigure(0, weight=1)
+        strip_frame.rowconfigure(0, weight=1)
+        self.frame_strip = ttk.Treeview(
+            strip_frame,
+            columns=("delay", "start", "size", "hotspot", "note"),
+            show="tree headings",
+            selectmode="browse",
+            height=4,
+        )
+        self.frame_strip.heading("#0", text="#")
+        self.frame_strip.heading("delay", text="Delay")
+        self.frame_strip.heading("start", text="Start")
+        self.frame_strip.heading("size", text="Size")
+        self.frame_strip.heading("hotspot", text="Hotspot")
+        self.frame_strip.heading("note", text="Timing Note")
+        self.frame_strip.column("#0", width=42, anchor="center")
+        self.frame_strip.column("delay", width=56, anchor="center")
+        self.frame_strip.column("start", width=58, anchor="center")
+        self.frame_strip.column("size", width=70, anchor="center")
+        self.frame_strip.column("hotspot", width=70, anchor="center")
+        self.frame_strip.column("note", width=max(140, canvas_size - 70), anchor="w")
+        self.frame_strip.grid(row=0, column=0, sticky="nsew")
+        strip_scroll = ttk.Scrollbar(strip_frame, orient="vertical", command=self.frame_strip.yview)
+        strip_scroll.grid(row=0, column=1, sticky="ns")
+        self.frame_strip.configure(yscrollcommand=strip_scroll.set)
+        self.frame_strip.bind("<<TreeviewSelect>>", self._on_frame_strip_selected)
+
         self.clear("No preview loaded")
 
     def destroy(self) -> None:
         self._cancel_after()
         super().destroy()
+
+    def set_title(self, title: str) -> None:
+        self.configure(text=title)
 
     def _cancel_after(self) -> None:
         if self.after_id is not None:
@@ -571,6 +1291,20 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         self.frame_info_var.set("")
         self.inspection_var.set("")
         self.warning_var.set("")
+        self.playhead_var.set("")
+        for item in self.frame_strip.get_children():
+            self.frame_strip.delete(item)
+
+    def set_loading(self, reason: str) -> None:
+        self.clear(reason)
+        self.canvas.delete("all")
+        self.canvas.create_text(
+            self.canvas_size // 2,
+            self.canvas_size // 2,
+            text="...",
+            fill=self.palette["preview_placeholder"],
+            font=("TkDefaultFont", 14, "bold"),
+        )
 
     def set_frames(
         self,
@@ -593,9 +1327,49 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         self.frame_info_var.set(frame_info)
         self.inspection_var.set(inspection_text)
         self.warning_var.set(warning_text)
+        self._populate_frame_strip(frames)
         self._draw_current_frame()
         if self.running:
             self._schedule_next_frame()
+
+    def _populate_frame_strip(self, frames: list[dict]) -> None:
+        for item in self.frame_strip.get_children():
+            self.frame_strip.delete(item)
+        inspection = inspect_animation_behavior(frames)
+        for row in inspection["frame_rows"]:
+            iid = f"frame-{row['index'] - 1}"
+            self.frame_strip.insert(
+                "",
+                "end",
+                iid=iid,
+                text=str(row["index"]),
+                values=(
+                    f"{row['delay_ms']}ms",
+                    f"{row['start_ms']}ms",
+                    row["size"],
+                    row["hotspot"],
+                    row["note"],
+                ),
+            )
+
+    def _on_frame_strip_selected(self, _event=None) -> None:
+        if self._strip_sync:
+            return
+        selection = self.frame_strip.selection()
+        if not selection:
+            return
+        try:
+            index = int(selection[0].split("-")[-1])
+        except ValueError:
+            return
+        self.pause()
+        self._select_frame(index)
+
+    def _select_frame(self, index: int) -> None:
+        if not self.frame_images:
+            return
+        self.current_index = max(0, min(index, len(self.frame_images) - 1))
+        self._draw_current_frame()
 
     def _draw_current_frame(self) -> None:
         self.canvas.delete("all")
@@ -613,6 +1387,21 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             fill=self.palette["preview_counter_text"],
             text=f"{self.current_index + 1}/{len(self.frame_images)}",
         )
+        current = self.frames[self.current_index]
+        self.playhead_var.set(
+            f"Frame {self.current_index + 1}: {int(current.get('delay_ms', 50))}ms | "
+            f"{int(current.get('width', 0))}x{int(current.get('height', 0))} | "
+            f"hotspot {int(current.get('hotspot_x', 0))},{int(current.get('hotspot_y', 0))}"
+        )
+        current_iid = f"frame-{self.current_index}"
+        if current_iid in self.frame_strip.get_children():
+            self._strip_sync = True
+            try:
+                self.frame_strip.selection_set(current_iid)
+                self.frame_strip.focus(current_iid)
+                self.frame_strip.see(current_iid)
+            finally:
+                self._strip_sync = False
 
     def _speed_multiplier(self) -> float:
         raw = self.speed_var.get().rstrip("x")
@@ -659,6 +1448,96 @@ class AnimationPreviewPanel(ttk.LabelFrame):
         if len(self.frame_images) > 1:
             self.running = True
             self._schedule_next_frame()
+
+    def step_prev(self) -> None:
+        if not self.frame_images:
+            return
+        self.pause()
+        self._select_frame((self.current_index - 1) % len(self.frame_images))
+
+    def step_next(self) -> None:
+        if not self.frame_images:
+            return
+        self.pause()
+        self._select_frame((self.current_index + 1) % len(self.frame_images))
+
+
+class ThemedTooltip:
+    def __init__(
+        self,
+        widget: tk.Widget,
+        text: str,
+        palette: dict[str, str],
+        *,
+        delay_ms: int = 450,
+        wraplength: int = 320,
+    ):
+        self.widget = widget
+        self.text = text
+        self.palette = palette
+        self.delay_ms = delay_ms
+        self.wraplength = wraplength
+        self.after_id: str | None = None
+        self.tipwindow: tk.Toplevel | None = None
+
+        self.widget.bind("<Enter>", self._schedule_show, add="+")
+        self.widget.bind("<Leave>", self._hide, add="+")
+        self.widget.bind("<ButtonPress>", self._hide, add="+")
+        self.widget.bind("<Destroy>", self._hide, add="+")
+
+    def _schedule_show(self, _event=None) -> None:
+        self._cancel_show()
+        self.after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel_show(self) -> None:
+        if self.after_id is not None:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self.after_id = None
+
+    def _show(self) -> None:
+        self.after_id = None
+        if self.tipwindow is not None or not self.widget.winfo_exists():
+            return
+
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+
+        tipwindow = tk.Toplevel(self.widget)
+        tipwindow.wm_overrideredirect(True)
+        try:
+            tipwindow.wm_attributes("-topmost", True)
+        except Exception:  # noqa: BLE001
+            pass
+        tipwindow.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(
+            tipwindow,
+            text=self.text,
+            justify="left",
+            wraplength=self.wraplength,
+            bg=self.palette["panel_bg"],
+            fg=self.palette["text"],
+            bd=1,
+            relief="solid",
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+            padx=8,
+            pady=6,
+        )
+        label.pack()
+        self.tipwindow = tipwindow
+
+    def _hide(self, _event=None) -> None:
+        self._cancel_show()
+        if self.tipwindow is not None:
+            try:
+                self.tipwindow.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self.tipwindow = None
 
 
 class SlotCard(tk.Frame):
@@ -749,7 +1628,15 @@ class SlotCard(tk.Frame):
                 pass
         self.update_card(None, None, None, False)
 
-    def update_card(self, path: str | None, summary: dict | None, quality: dict | None, selected: bool) -> None:
+    def update_card(
+        self,
+        path: str | None,
+        summary: dict | None,
+        quality: dict | None,
+        selected: bool,
+        *,
+        loading_message: str | None = None,
+    ) -> None:
         bg = self.palette["card_selected_bg"] if selected else self.palette["card_bg"]
         fg = self.palette["selection_text"] if selected else self.palette["card_text"]
         muted_fg = self.palette["selection_text"] if selected else self.palette["card_muted_text"]
@@ -775,10 +1662,24 @@ class SlotCard(tk.Frame):
                 fill=self.palette["preview_placeholder"],
             )
 
-        if not path or summary is None:
+        if not path:
             self.file_label.configure(text="Unassigned")
             self.badge_label.configure(text="Choose a source or use Auto-Fill")
             self.path_label.configure(text="")
+            self.warning_label.configure(text="")
+            return
+
+        if loading_message:
+            self.file_label.configure(text=f"{Path(path).name}   [loading]")
+            self.badge_label.configure(text=loading_message)
+            self.path_label.configure(text=compact_path(path))
+            self.warning_label.configure(text="")
+            return
+
+        if summary is None:
+            self.file_label.configure(text=Path(path).name)
+            self.badge_label.configure(text="No summary available")
+            self.path_label.configure(text=compact_path(path))
             self.warning_label.configure(text="")
             return
 
@@ -868,7 +1769,7 @@ def draw_slot_glyph(canvas: tk.Canvas, slot_key: str, palette: dict[str, str], b
 class MappingApp:
     def __init__(self, root: tk.Tk, palette_path: Path | None = None):
         self.root = root
-        self.root.title("win2kde Cursor Converter")
+        self.root.title("CursorForge")
         self.root.geometry("1560x1040")
         self.palette, self.palette_path, self.palette_name = load_gui_palette(palette_path)
         self.style = ttk.Style(root)
@@ -877,13 +1778,24 @@ class MappingApp:
         self.last_tar_path: Path | None = None
         self.last_theme_dir: Path | None = None
         self.pack_analysis: dict | None = None
+        self.pack_asset_lookup: dict[str, dict] = {}
         self.selected_slot_key = SLOT_DEFS[0]["key"]
         self.selected_candidate_path: str | None = None
+        self.slot_selection_context: dict[str, dict] = {}
+        self.analysis_action_items: dict[str, dict] = {}
 
-        self.preview_photo_cache: dict[str, tk.PhotoImage] = {}
-        self.source_metadata_cache: dict[str, dict] = {}
-        self.output_preview_cache: dict[str, dict] = {}
-        self.summary_cache: dict[str, dict] = {}
+        self.preview_photo_cache: BoundedCache[tuple, tk.PhotoImage] = BoundedCache(max_entries=384)
+        self.source_metadata_cache: BoundedCache[tuple, dict] = BoundedCache(max_entries=128)
+        self.output_preview_cache: BoundedCache[tuple, dict] = BoundedCache(max_entries=96)
+        self.summary_cache: BoundedCache[tuple, dict] = BoundedCache(max_entries=192)
+        self.slot_states = {slot["key"]: SlotRenderState() for slot in SLOT_DEFS}
+        self.request_tracker = RequestTracker()
+        self.task_runner = GuiTaskRunner(self.root)
+        self._suspend_refresh_traces = False
+        self.analysis_busy = False
+        self.auto_prepare_busy = False
+        self.build_busy = False
+        self.tooltips: list[ThemedTooltip] = []
         self.slot_paths = {slot["key"]: "" for slot in SLOT_DEFS}
 
         self.source_dir_var = tk.StringVar()
@@ -899,6 +1811,11 @@ class MappingApp:
         self.preset_description_var = tk.StringVar(value=describe_build_preset(self.build_preset_var.get()))
         self.overall_quality_var = tk.StringVar(value="Overall quality forecast: --")
         self.last_output_var = tk.StringVar(value="No build output yet")
+        self.compare_mode_var = tk.StringVar(value=COMPARE_MODE_CURRENT_VS_CANDIDATE)
+        self.compare_preset_var = tk.StringVar(value=SAFE_PRESET_LABEL)
+        self.compare_summary_var = tk.StringVar(value="Select a slot and candidate to compare.")
+        self.compare_hint_var = tk.StringVar(value="")
+        self.analysis_action_detail_var = tk.StringVar(value="Analyze a pack to build an action queue.")
         self.palette_name_var = tk.StringVar(
             value=f"GUI palette: {self.palette_name} ({self.palette_path.name})" if self.palette_path else "GUI palette: built-in"
         )
@@ -906,11 +1823,13 @@ class MappingApp:
         self._apply_palette()
         self._build_ui()
         self._refresh_all_views()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.target_sizes_var.trace_add("write", lambda *_: self.on_build_settings_changed())
-        self.scale_filter_var.trace_add("write", lambda *_: self.on_build_settings_changed())
-        self.preview_nominal_size_var.trace_add("write", lambda *_: self._refresh_selected_slot_detail())
+        self.target_sizes_var.trace_add("write", lambda *_: self._on_target_sizes_changed())
+        self.scale_filter_var.trace_add("write", lambda *_: self._on_scale_filter_changed())
+        self.preview_nominal_size_var.trace_add("write", lambda *_: self._on_preview_size_changed())
         self.build_preset_var.trace_add("write", lambda *_: self._update_preset_description())
+        self.compare_preset_var.trace_add("write", lambda *_: self._refresh_compare_view())
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=12)
@@ -924,7 +1843,7 @@ class MappingApp:
 
         ttk.Label(
             header,
-            text="Windows cursor pack -> Linux Xcursor theme",
+            text="CursorForge",
             font=("", 13, "bold"),
             style="Heading.TLabel",
         ).grid(row=0, column=0, sticky="w")
@@ -1072,6 +1991,261 @@ class MappingApp:
             background=[("selected", palette["card_selected_bg"])],
             foreground=[("selected", palette["selection_text"])],
         )
+        self._install_file_dialog_theme_hook()
+
+    def _install_file_dialog_theme_hook(self) -> None:
+        palette = self.palette
+        script = """
+namespace eval ::cursorforge::filedialogtheme {
+    variable bg {%s}
+    variable fg {%s}
+    variable border {%s}
+    variable history_paths
+    variable history_index
+    variable in_navigation
+}
+
+proc ::cursorforge::filedialogtheme::ensure_tk_dialog_commands {} {
+    global tk_library
+
+    if {![llength [info commands ::tk::dialog::file::Create]]} {
+        catch {source [file join $tk_library tkfbox.tcl]}
+    }
+    if {![llength [info commands ::tk::dialog::file::chooseDir::]]} {
+        catch {source [file join $tk_library choosedir.tcl]}
+    }
+}
+
+proc ::cursorforge::filedialogtheme::current_path {w} {
+    upvar ::tk::dialog::file::[winfo name $w] data
+    if {![info exists data(selectPath)]} {
+        return [pwd]
+    }
+    if {[catch {file normalize $data(selectPath)} normalized]} {
+        return $data(selectPath)
+    }
+    return $normalized
+}
+
+proc ::cursorforge::filedialogtheme::update_button_states {w} {
+    variable history_paths
+    variable history_index
+
+    if {![winfo exists $w.contents.nav]} {
+        return
+    }
+
+    set back_state disabled
+    set forward_state disabled
+    if {[info exists history_index($w)]} {
+        if {$history_index($w) > 0} {
+            set back_state normal
+        }
+        if {[info exists history_paths($w)] && $history_index($w) < ([llength $history_paths($w)] - 1)} {
+            set forward_state normal
+        }
+    }
+
+    set current [current_path $w]
+    set up_state normal
+    if {$current eq [file dirname $current]} {
+        set up_state disabled
+    }
+
+    set home_state normal
+    if {[catch {file normalize ~} home] || $home eq $current} {
+        set home_state disabled
+    }
+
+    $w.contents.nav.back configure -state $back_state
+    $w.contents.nav.forward configure -state $forward_state
+    $w.contents.nav.up configure -state $up_state
+    $w.contents.nav.home configure -state $home_state
+}
+
+proc ::cursorforge::filedialogtheme::remember_current_path {w} {
+    variable history_paths
+    variable history_index
+
+    if {![winfo exists $w]} {
+        return
+    }
+
+    set path [current_path $w]
+    if {[info exists history_paths($w)] && [info exists history_index($w)]} {
+        if {[lindex $history_paths($w) $history_index($w)] eq $path} {
+            update_button_states $w
+            return
+        }
+    }
+
+    set history_paths($w) [list $path]
+    set history_index($w) 0
+    update_button_states $w
+}
+
+proc ::cursorforge::filedialogtheme::record_path {w path} {
+    variable history_paths
+    variable history_index
+    variable in_navigation
+
+    if {![winfo exists $w]} {
+        return
+    }
+
+    if {[catch {file normalize $path} normalized]} {
+        set normalized $path
+    }
+
+    if {[info exists in_navigation($w)] && $in_navigation($w)} {
+        update_button_states $w
+        return
+    }
+
+    if {![info exists history_paths($w)] || ![info exists history_index($w)]} {
+        set history_paths($w) [list $normalized]
+        set history_index($w) 0
+        update_button_states $w
+        return
+    }
+
+    if {[lindex $history_paths($w) $history_index($w)] eq $normalized} {
+        update_button_states $w
+        return
+    }
+
+    set trimmed [lrange $history_paths($w) 0 $history_index($w)]
+    lappend trimmed $normalized
+    set history_paths($w) $trimmed
+    set history_index($w) [expr {[llength $trimmed] - 1}]
+    update_button_states $w
+}
+
+proc ::cursorforge::filedialogtheme::navigate_to_index {w idx} {
+    variable history_paths
+    variable history_index
+    variable in_navigation
+
+    if {![info exists history_paths($w)] || ![info exists history_index($w)]} {
+        return
+    }
+    if {$idx < 0 || $idx >= [llength $history_paths($w)]} {
+        return
+    }
+
+    upvar ::tk::dialog::file::[winfo name $w] data
+    set history_index($w) $idx
+    set in_navigation($w) 1
+    set data(selectPath) [lindex $history_paths($w) $idx]
+    set in_navigation($w) 0
+    update_button_states $w
+}
+
+proc ::cursorforge::filedialogtheme::go_back {w} {
+    variable history_index
+    if {![info exists history_index($w)] || $history_index($w) <= 0} {
+        return
+    }
+    navigate_to_index $w [expr {$history_index($w) - 1}]
+}
+
+proc ::cursorforge::filedialogtheme::go_forward {w} {
+    variable history_index
+    variable history_paths
+    if {![info exists history_index($w)] || ![info exists history_paths($w)]} {
+        return
+    }
+    if {$history_index($w) >= [llength $history_paths($w)] - 1} {
+        return
+    }
+    navigate_to_index $w [expr {$history_index($w) + 1}]
+}
+
+proc ::cursorforge::filedialogtheme::go_up {w} {
+    upvar ::tk::dialog::file::[winfo name $w] data
+    set current [current_path $w]
+    set parent [file dirname $current]
+    if {$parent ne $current} {
+        set data(selectPath) $parent
+    }
+}
+
+proc ::cursorforge::filedialogtheme::go_home {w} {
+    if {[catch {file normalize ~} home]} {
+        return
+    }
+    upvar ::tk::dialog::file::[winfo name $w] data
+    set data(selectPath) $home
+}
+
+proc ::cursorforge::filedialogtheme::ensure_nav {w} {
+    if {![winfo exists $w.contents.nav]} {
+        set nav [ttk::frame $w.contents.nav]
+        ttk::button $nav.home -text "Home" -command [list ::cursorforge::filedialogtheme::go_home $w]
+        ttk::button $nav.back -text "Back" -command [list ::cursorforge::filedialogtheme::go_back $w]
+        ttk::button $nav.forward -text "Forward" -command [list ::cursorforge::filedialogtheme::go_forward $w]
+        ttk::button $nav.up -text "Up" -command [list ::cursorforge::filedialogtheme::go_up $w]
+        pack $nav.home $nav.back $nav.forward $nav.up -side left -padx {0 6}
+        pack $nav -side top -fill x -before $w.contents.f1 -padx 4 -pady {4 0}
+    }
+
+    if {[winfo exists $w.contents.f1.up]} {
+        catch {pack forget $w.contents.f1.up}
+    }
+}
+
+proc ::cursorforge::filedialogtheme::apply {w} {
+    variable bg
+    variable fg
+    variable border
+
+    ensure_nav $w
+
+    set icons $w.contents.icons
+    set canvas $icons.canvas
+    if {![winfo exists $canvas]} {
+        return
+    }
+
+    catch {$canvas configure -background $bg}
+    catch {$canvas configure -highlightbackground $border -highlightcolor $border}
+    catch {$canvas itemconfigure text -fill $fg}
+
+    if {![catch {info object namespace $icons} icon_ns] && $icon_ns ne ""} {
+        catch {namespace eval $icon_ns [list set fill $fg]}
+    }
+
+    remember_current_path $w
+}
+
+if {![llength [info commands ::tk::dialog::file::Create__cursorforge_orig]]} {
+    ::cursorforge::filedialogtheme::ensure_tk_dialog_commands
+    if {[llength [info commands ::tk::dialog::file::Create]]} {
+        rename ::tk::dialog::file::Create ::tk::dialog::file::Create__cursorforge_orig
+        proc ::tk::dialog::file::Create {w class} {
+            ::tk::dialog::file::Create__cursorforge_orig $w $class
+            catch {::cursorforge::filedialogtheme::apply $w}
+        }
+    }
+}
+
+if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
+    ::cursorforge::filedialogtheme::ensure_tk_dialog_commands
+    if {[llength [info commands ::tk::dialog::file::SetPath]]} {
+        rename ::tk::dialog::file::SetPath ::tk::dialog::file::SetPath__cursorforge_orig
+        proc ::tk::dialog::file::SetPath {w name1 name2 op} {
+            ::tk::dialog::file::SetPath__cursorforge_orig $w $name1 $name2 $op
+            if {[winfo exists $w]} {
+                upvar ::tk::dialog::file::[winfo name $w] data
+                if {[info exists data(selectPath)]} {
+                    catch {::cursorforge::filedialogtheme::record_path $w $data(selectPath)}
+                }
+            }
+        }
+    }
+}
+""" % (palette["entry_bg"], palette["entry_fg"], palette["border"])
+        self.root.tk.eval(script)
 
     def _theme_text_widget(self, widget: tk.Text, *, bg_key: str = "content_bg", fg_key: str = "text") -> None:
         widget.configure(
@@ -1087,6 +2261,9 @@ class MappingApp:
             bd=0,
         )
 
+    def _attach_tooltip(self, widget: tk.Widget, text: str) -> None:
+        self.tooltips.append(ThemedTooltip(widget, text, self.palette))
+
     def _build_analysis_tab(self) -> None:
         self.analysis_tab.columnconfigure(0, weight=1)
         self.analysis_tab.rowconfigure(3, weight=1)
@@ -1098,8 +2275,18 @@ class MappingApp:
         ttk.Label(controls, text="Windows cursor folder").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(controls, textvariable=self.source_dir_var).grid(row=0, column=1, sticky="ew", pady=3)
         ttk.Button(controls, text="Browse", command=self.choose_source_dir).grid(row=0, column=2, padx=(8, 0), pady=3)
-        ttk.Button(controls, text="Analyze Pack", command=self.analyze_pack).grid(row=0, column=3, padx=(8, 0), pady=3)
-        ttk.Button(controls, text="Auto-Fill From Pack", command=self.auto_prepare).grid(row=0, column=4, padx=(8, 0), pady=3)
+        self.analyze_button = ttk.Button(controls, text="Analyze Pack", command=self.analyze_pack)
+        self.analyze_button.grid(row=0, column=3, padx=(8, 0), pady=3)
+        self._attach_tooltip(
+            self.analyze_button,
+            "Checks the cursor pack and shows what it contains, how much animation and HiDPI detail it has, and any obvious problems.",
+        )
+        self.auto_fill_button = ttk.Button(controls, text="Auto-Fill From Pack", command=self.auto_prepare)
+        self.auto_fill_button.grid(row=0, column=4, padx=(8, 0), pady=3)
+        self._attach_tooltip(
+            self.auto_fill_button,
+            "Fills in the slot guesses for you using the pack data and filenames. Good starting point before fixing anything by hand.",
+        )
 
         ttk.Label(controls, text="Pack analysis").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=(12, 3))
         ttk.Label(
@@ -1178,12 +2365,62 @@ class MappingApp:
 
         right = ttk.LabelFrame(overview, text="Warnings And Diagnostics", padding=10)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
         self.analysis_detail_text = tk.Text(right, height=8, wrap="word")
         self.analysis_detail_text.grid(row=0, column=0, sticky="nsew")
         self._theme_text_widget(self.analysis_detail_text)
         set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
+
+        action_frame = ttk.LabelFrame(right, text="Action Queue", padding=8)
+        action_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        action_frame.columnconfigure(0, weight=1)
+        action_frame.rowconfigure(0, weight=1)
+        self.analysis_action_tree = ttk.Treeview(
+            action_frame,
+            columns=("severity", "category", "target", "next"),
+            show="tree headings",
+            selectmode="browse",
+            height=6,
+        )
+        self.analysis_action_tree.heading("#0", text="Issue")
+        self.analysis_action_tree.heading("severity", text="Severity")
+        self.analysis_action_tree.heading("category", text="Category")
+        self.analysis_action_tree.heading("target", text="Target")
+        self.analysis_action_tree.heading("next", text="Suggested Next Step")
+        self.analysis_action_tree.column("#0", width=260, anchor="w")
+        self.analysis_action_tree.column("severity", width=70, anchor="center")
+        self.analysis_action_tree.column("category", width=120, anchor="center")
+        self.analysis_action_tree.column("target", width=140, anchor="w")
+        self.analysis_action_tree.column("next", width=210, anchor="w")
+        self.analysis_action_tree.grid(row=0, column=0, sticky="nsew")
+        action_scroll = ttk.Scrollbar(action_frame, orient="vertical", command=self.analysis_action_tree.yview)
+        action_scroll.grid(row=0, column=1, sticky="ns")
+        self.analysis_action_tree.configure(yscrollcommand=action_scroll.set)
+        self.analysis_action_tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_analysis_action_detail())
+        self.analysis_action_tree.bind("<Double-1>", lambda _event: self._run_selected_analysis_action())
+
+        ttk.Label(
+            action_frame,
+            textvariable=self.analysis_action_detail_var,
+            wraplength=620,
+            justify="left",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        action_buttons = ttk.Frame(action_frame)
+        action_buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(action_buttons, text="Open Target", command=self._run_selected_analysis_action).grid(row=0, column=0)
+        ttk.Button(action_buttons, text="Open Compare", command=self._run_selected_analysis_compare_action).grid(
+            row=0,
+            column=1,
+            padx=(6, 0),
+        )
+        ttk.Button(action_buttons, text="Apply Suggested Preset", command=self._apply_selected_analysis_preset).grid(
+            row=0,
+            column=2,
+            padx=(6, 0),
+        )
 
         assets_frame = ttk.LabelFrame(self.analysis_tab, text="Detected Source Assets", padding=10)
         assets_frame.grid(row=3, column=0, sticky="nsew")
@@ -1210,6 +2447,7 @@ class MappingApp:
         self.analysis_asset_tree.column("flags", width=330, anchor="w")
         self.analysis_asset_tree.column("location", width=380, anchor="w")
         self.analysis_asset_tree.grid(row=0, column=0, sticky="nsew")
+        self.analysis_asset_tree.bind("<Double-1>", lambda _event: self._review_selected_analysis_asset())
 
         scroll_y = ttk.Scrollbar(assets_frame, orient="vertical", command=self.analysis_asset_tree.yview)
         scroll_y.grid(row=0, column=1, sticky="ns")
@@ -1295,6 +2533,7 @@ class MappingApp:
         ttk.Button(action_row, text="Browse Source", command=lambda: self.browse_slot(self.selected_slot_key)).grid(row=0, column=0)
         ttk.Button(action_row, text="Clear Slot", command=lambda: self.clear_slot(self.selected_slot_key)).grid(row=0, column=1, padx=(6, 0))
         ttk.Button(action_row, text="Use Selected Candidate", command=self.apply_selected_candidate).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(action_row, text="Open Compare", command=self.open_compare_view).grid(row=0, column=3, padx=(6, 0))
 
         preview_size_row = ttk.Frame(detail)
         preview_size_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
@@ -1324,13 +2563,18 @@ class MappingApp:
         self.output_preview_panel = AnimationPreviewPanel(preview_row, "Predicted Linux Output Preview", PLAYER_PREVIEW_SIZE, self.palette)
         self.output_preview_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        candidate_frame = ttk.LabelFrame(right, text="Ranked Candidate Browser", padding=10)
-        candidate_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
-        candidate_frame.columnconfigure(0, weight=1)
-        candidate_frame.rowconfigure(0, weight=1)
+        self.review_tool_notebook = ttk.Notebook(right)
+        self.review_tool_notebook.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.candidate_browser_tab = ttk.Frame(self.review_tool_notebook, padding=8)
+        self.compare_tab = ttk.Frame(self.review_tool_notebook, padding=8)
+        self.review_tool_notebook.add(self.candidate_browser_tab, text="Candidates")
+        self.review_tool_notebook.add(self.compare_tab, text="Compare")
+
+        self.candidate_browser_tab.columnconfigure(0, weight=1)
+        self.candidate_browser_tab.rowconfigure(0, weight=1)
 
         self.candidate_tree = ttk.Treeview(
-            candidate_frame,
+            self.candidate_browser_tab,
             columns=("type", "sizes", "score", "reason"),
             show="tree headings",
             selectmode="browse",
@@ -1341,37 +2585,90 @@ class MappingApp:
         self.candidate_tree.heading("sizes", text="Native Sizes")
         self.candidate_tree.heading("score", text="Score")
         self.candidate_tree.heading("reason", text="Ranking Reason")
-        self.candidate_tree.column("#0", width=240, anchor="w")
+        self.candidate_tree.column("#0", width=220, anchor="w")
         self.candidate_tree.column("type", width=70, anchor="center")
         self.candidate_tree.column("sizes", width=110, anchor="center")
         self.candidate_tree.column("score", width=70, anchor="center")
-        self.candidate_tree.column("reason", width=330, anchor="w")
+        self.candidate_tree.column("reason", width=310, anchor="w")
         self.candidate_tree.grid(row=0, column=0, sticky="nsew")
-        candidate_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=self.candidate_tree.yview)
+        candidate_scroll = ttk.Scrollbar(self.candidate_browser_tab, orient="vertical", command=self.candidate_tree.yview)
         candidate_scroll.grid(row=0, column=1, sticky="ns")
         self.candidate_tree.configure(yscrollcommand=candidate_scroll.set)
         self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_candidate_detail())
 
-        candidate_detail = ttk.Frame(candidate_frame)
-        candidate_detail.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        candidate_detail = ttk.Frame(self.candidate_browser_tab)
+        candidate_detail.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
         candidate_detail.columnconfigure(1, weight=1)
+        candidate_detail.rowconfigure(0, weight=1)
+        candidate_detail.rowconfigure(1, weight=1)
         self.candidate_preview_panel = AnimationPreviewPanel(candidate_detail, "Candidate Preview", CANDIDATE_PREVIEW_SIZE, self.palette)
-        self.candidate_preview_panel.grid(row=0, column=0, rowspan=2, sticky="nw")
-        self.candidate_summary_var = tk.StringVar(value="Select a candidate to inspect it.")
-        self.candidate_warning_var = tk.StringVar(value="")
-        ttk.Label(candidate_detail, textvariable=self.candidate_summary_var, wraplength=620, justify="left").grid(
-            row=0,
-            column=1,
-            sticky="nw",
-            padx=(10, 0),
+        self.candidate_preview_panel.grid(row=0, column=0, rowspan=2, sticky="nsw")
+        explain_frame = ttk.LabelFrame(candidate_detail, text="Why This Candidate Ranks Here", padding=8)
+        explain_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        explain_frame.columnconfigure(0, weight=1)
+        explain_frame.rowconfigure(0, weight=1)
+        self.candidate_reason_text = tk.Text(explain_frame, height=8, wrap="word")
+        self.candidate_reason_text.grid(row=0, column=0, sticky="nsew")
+        self._theme_text_widget(self.candidate_reason_text)
+        set_readonly_text(self.candidate_reason_text, "Select a candidate to inspect its ranking logic.")
+
+        current_choice_frame = ttk.LabelFrame(candidate_detail, text="Why The Current Choice Was Made", padding=8)
+        current_choice_frame.grid(row=1, column=1, sticky="nsew", padx=(10, 0), pady=(8, 0))
+        current_choice_frame.columnconfigure(0, weight=1)
+        current_choice_frame.rowconfigure(0, weight=1)
+        self.current_choice_text = tk.Text(current_choice_frame, height=7, wrap="word")
+        self.current_choice_text.grid(row=0, column=0, sticky="nsew")
+        self._theme_text_widget(self.current_choice_text)
+        set_readonly_text(self.current_choice_text, "Auto-fill or select a slot to explain the active choice.")
+
+        self.compare_tab.columnconfigure(0, weight=1)
+        self.compare_tab.rowconfigure(3, weight=1)
+
+        compare_controls = ttk.LabelFrame(self.compare_tab, text="Compare Mode", padding=8)
+        compare_controls.grid(row=0, column=0, sticky="ew")
+        compare_controls.columnconfigure(3, weight=1)
+        ttk.Label(compare_controls, text="Mode").grid(row=0, column=0, sticky="w")
+        self.compare_mode_combo = ttk.Combobox(
+            compare_controls,
+            textvariable=self.compare_mode_var,
+            values=COMPARE_MODE_CHOICES,
+            state="readonly",
+            width=28,
         )
-        ttk.Label(
-            candidate_detail,
-            textvariable=self.candidate_warning_var,
-            wraplength=620,
-            justify="left",
-            style="Warning.TLabel",
-        ).grid(row=1, column=1, sticky="nw", padx=(10, 0), pady=(6, 0))
+        self.compare_mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 12))
+        self.compare_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_compare_view())
+        ttk.Label(compare_controls, text="Compare preset").grid(row=0, column=2, sticky="e")
+        self.compare_preset_combo = ttk.Combobox(
+            compare_controls,
+            textvariable=self.compare_preset_var,
+            values=BUILD_PRESET_LABELS,
+            state="readonly",
+            width=18,
+        )
+        self.compare_preset_combo.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Button(compare_controls, text="Replay Both", command=self._replay_compare_panels).grid(row=0, column=4, padx=(12, 0))
+
+        ttk.Label(self.compare_tab, textvariable=self.compare_summary_var, wraplength=860, justify="left").grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Label(self.compare_tab, textvariable=self.compare_hint_var, wraplength=860, justify="left", style="Muted.TLabel").grid(
+            row=2,
+            column=0,
+            sticky="nw",
+            pady=(4, 8),
+        )
+
+        compare_panels = ttk.Frame(self.compare_tab)
+        compare_panels.grid(row=3, column=0, sticky="nsew")
+        compare_panels.columnconfigure(0, weight=1)
+        compare_panels.columnconfigure(1, weight=1)
+        self.compare_left_panel = AnimationPreviewPanel(compare_panels, "Left Compare", PLAYER_PREVIEW_SIZE, self.palette)
+        self.compare_left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.compare_right_panel = AnimationPreviewPanel(compare_panels, "Right Compare", PLAYER_PREVIEW_SIZE, self.palette)
+        self.compare_right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
     def _build_build_tab(self) -> None:
         self.build_tab.columnconfigure(0, weight=1)
@@ -1392,7 +2689,12 @@ class MappingApp:
             width=18,
         )
         self.preset_combo.grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Button(top, text="Apply Preset", command=self.apply_selected_preset).grid(row=0, column=2, padx=(8, 0), pady=3)
+        apply_preset_button = ttk.Button(top, text="Apply Preset", command=self.apply_selected_preset)
+        apply_preset_button.grid(row=0, column=2, padx=(8, 0), pady=3)
+        self._attach_tooltip(
+            apply_preset_button,
+            "Quickly switches the build sizes and scaling style to one of the preset options.",
+        )
         ttk.Label(top, textvariable=self.preset_description_var, wraplength=760, justify="left", style="Muted.TLabel").grid(
             row=0,
             column=3,
@@ -1430,14 +2732,19 @@ class MappingApp:
         quality_frame = ttk.LabelFrame(self.build_tab, text="Quality Forecast And Validation", padding=10)
         quality_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(10, 0))
         quality_frame.columnconfigure(0, weight=1)
-        quality_frame.rowconfigure(1, weight=1)
+        quality_frame.rowconfigure(2, weight=1)
         ttk.Label(quality_frame, textvariable=self.overall_quality_var, font=("", 11, "bold"), style="Heading.TLabel").grid(
             row=0,
             column=0,
             sticky="w",
         )
+        quality_actions = ttk.Frame(quality_frame)
+        quality_actions.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(quality_actions, text="Review Weak Slot", command=self.review_most_at_risk_slot).grid(row=0, column=0)
+        ttk.Button(quality_actions, text="Open Compare", command=self.open_compare_view).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(quality_actions, text=f"Use {SAFE_PRESET_LABEL}", command=self.apply_safe_preset).grid(row=0, column=2, padx=(6, 0))
         self.build_warning_text = tk.Text(quality_frame, wrap="word")
-        self.build_warning_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.build_warning_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         self._theme_text_widget(self.build_warning_text)
         set_readonly_text(self.build_warning_text, "Warnings and build guidance will appear here.")
 
@@ -1448,10 +2755,27 @@ class MappingApp:
 
         button_row = ttk.Frame(export_frame)
         button_row.grid(row=0, column=0, sticky="ew")
-        ttk.Button(button_row, text="Load JSON", command=self.load_json).grid(row=0, column=0)
-        ttk.Button(button_row, text="Save JSON", command=self.save_json).grid(row=0, column=1, padx=(6, 0))
-        ttk.Button(button_row, text="Save Markdown", command=self.save_markdown).grid(row=0, column=2, padx=(6, 0))
-        ttk.Button(button_row, text="Build + Package", command=self.build_and_package).grid(row=0, column=3, padx=(12, 0))
+        load_json_button = ttk.Button(button_row, text="Load JSON", command=self.load_json)
+        load_json_button.grid(row=0, column=0)
+        self._attach_tooltip(load_json_button, "Loads a saved mapping so you can pick up where you left off.")
+        save_json_button = ttk.Button(button_row, text="Save JSON", command=self.save_json)
+        save_json_button.grid(row=0, column=1, padx=(6, 0))
+        self._attach_tooltip(
+            save_json_button,
+            "Saves your current mapping so you can reuse it later or build from it again.",
+        )
+        save_markdown_button = ttk.Button(button_row, text="Save Markdown", command=self.save_markdown)
+        save_markdown_button.grid(row=0, column=2, padx=(6, 0))
+        self._attach_tooltip(
+            save_markdown_button,
+            "Exports a simple readable report of the current slot mapping and Linux cursor roles.",
+        )
+        self.build_button = ttk.Button(button_row, text="Build + Package", command=self.build_and_package)
+        self.build_button.grid(row=0, column=3, padx=(12, 0))
+        self._attach_tooltip(
+            self.build_button,
+            "Builds the cursor theme and packs it into a tarball you can install or share.",
+        )
 
         self.build_summary_text = tk.Text(export_frame, wrap="word")
         self.build_summary_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
@@ -1472,6 +2796,717 @@ class MappingApp:
         except KeyError:
             pass
 
+    def on_close(self) -> None:
+        self.task_runner.close()
+        self.root.destroy()
+
+    def _set_pack_analysis(self, analysis: dict | None) -> None:
+        self.pack_analysis = analysis
+        self.pack_asset_lookup = {
+            asset["path"]: asset
+            for asset in (analysis or {}).get("asset_summaries", [])
+            if asset.get("path")
+        }
+
+    def _ambiguous_candidates_for_slot(self, slot_key: str) -> list[dict]:
+        if self.pack_analysis is None:
+            return []
+        return list(self.pack_analysis.get("ambiguous_candidates", {}).get(slot_key, []))
+
+    def _asset_summary_for_path(self, path: str | Path) -> dict | None:
+        normalized = str(normalize_path(Path(path)))
+        return self.pack_asset_lookup.get(normalized)
+
+    def _slot_candidates(self, slot_key: str) -> list[dict]:
+        if self.pack_analysis is None:
+            return []
+        return list(self.pack_analysis.get("slot_candidates", {}).get(slot_key, []))
+
+    def _candidate_for_slot_path(self, slot_key: str, path: str | Path) -> dict | None:
+        normalized = str(normalize_path(Path(path)))
+        for candidate in self._slot_candidates(slot_key):
+            if candidate.get("path") == normalized:
+                return candidate
+        return None
+
+    def _selection_origin_label(self, origin: str) -> str:
+        return {
+            "inf": "install.inf",
+            "heuristic": "filename heuristic",
+            "fallback": "fallback reuse",
+            "override": "auto-fill override",
+            "manual-candidate": "manual candidate choice",
+            "manual-browse": "manual browse choice",
+            "loaded": "loaded mapping",
+            "unknown": "current assignment",
+        }.get(origin, origin.replace("-", " "))
+
+    def _infer_selection_context(self, slot_key: str, path: str) -> dict:
+        normalized = str(normalize_path(Path(path)))
+        analysis = self.pack_analysis or {}
+        inf_mapping = analysis.get("install_inf_mapping", {})
+        if inf_mapping.get(slot_key) == normalized:
+            return {
+                "origin": "inf",
+                "path": normalized,
+                "reason": "Auto-fill kept the path explicitly referenced by install.inf.",
+            }
+        candidate = self._candidate_for_slot_path(slot_key, normalized)
+        if candidate is not None:
+            return {
+                "origin": "heuristic",
+                "path": normalized,
+                "reason": candidate.get("reason", "Chosen from the ranked candidate browser."),
+                "rank": candidate.get("rank"),
+                "score": candidate.get("score"),
+            }
+        return {
+            "origin": "loaded",
+            "path": normalized,
+            "reason": "This assignment came from a loaded mapping or a manual source path.",
+        }
+
+    def _selection_context_for_slot(self, slot_key: str, path: str | None = None) -> dict | None:
+        current_path = path or self.slot_paths.get(slot_key, "")
+        if not current_path:
+            return None
+        context = self.slot_selection_context.get(slot_key)
+        if context and context.get("path") == current_path:
+            return context
+        inferred = self._infer_selection_context(slot_key, current_path)
+        self.slot_selection_context[slot_key] = inferred
+        return inferred
+
+    def _set_selection_context(self, slot_key: str, context: dict | None) -> None:
+        if context is None:
+            self.slot_selection_context.pop(slot_key, None)
+            return
+        self.slot_selection_context[slot_key] = context
+
+    def _selection_context_payload(self) -> dict:
+        payload = {}
+        for slot_key, context in self.slot_selection_context.items():
+            path = self.slot_paths.get(slot_key, "").strip()
+            if not path:
+                continue
+            if context.get("path") != path:
+                continue
+            payload[slot_key] = dict(context)
+        return payload
+
+    def _apply_prepare_selection_context(self, summary: dict) -> None:
+        diagnostics = summary.get("diagnostics", {})
+        context: dict[str, dict] = {}
+        for slot_key, path in diagnostics.get("chosen_by_inf", {}).items():
+            context[slot_key] = {
+                "origin": "inf",
+                "path": path,
+                "reason": "Auto-fill used install.inf for this slot.",
+            }
+        for slot_key, item in diagnostics.get("chosen_by_heuristic", {}).items():
+            context[slot_key] = {
+                "origin": "heuristic",
+                "path": item["path"],
+                "reason": item.get("reason", "Auto-fill used the top-ranked filename candidate."),
+                "rank": 1,
+                "score": item.get("score"),
+            }
+        for item in diagnostics.get("fallbacks", []):
+            context[item["target"]] = {
+                "origin": "fallback",
+                "path": item["path"],
+                "reason": f"Auto-fill reused {SLOT_BY_KEY[item['source']]['label']} because this slot had no stronger standalone match.",
+                "source_slot": item["source"],
+            }
+        for item in diagnostics.get("overrides", []):
+            context[item["target"]] = {
+                "origin": "override",
+                "path": item["to"],
+                "reason": item.get("reason", "Auto-fill applied a post-selection override."),
+                "from_path": item.get("from"),
+            }
+        self.slot_selection_context = context
+        for slot in SLOT_DEFS:
+            path = self.slot_paths.get(slot["key"], "").strip()
+            if path and slot["key"] not in self.slot_selection_context:
+                self.slot_selection_context[slot["key"]] = self._infer_selection_context(slot["key"], path)
+
+    def _candidate_reason_for_tree(self, slot_key: str, candidate: dict) -> str:
+        if candidate.get("path") == (self.pack_analysis or {}).get("install_inf_mapping", {}).get(slot_key):
+            return "INF-backed candidate"
+        reason = summarize_match_details(candidate.get("match_details", {}))
+        if candidate.get("low_priority_hits"):
+            reason += " | generated-folder penalty"
+        elif int(candidate.get("depth", 0)) > 1:
+            reason += " | deeper path tie-break"
+        return reason
+
+    def _candidate_explanation_text(self, slot_key: str, candidate: dict, summary: dict, quality: dict) -> str:
+        leader = self._slot_candidates(slot_key)[0] if self._slot_candidates(slot_key) else None
+        lines = [
+            f"Candidate: {Path(candidate['path']).name}",
+            f"Rank: #{candidate.get('rank', '--')} | score {candidate.get('score', '--')}",
+            f"Match basis: {summarize_match_details(candidate.get('match_details', {}))}",
+            f"Ranking outcome: {candidate_rank_gap_reason(candidate, leader)}",
+            f"Source location: {summary.get('relative_path', compact_path(candidate['path'], max_len=96))}",
+            f"Quality forecast: {quality['label']} ({quality.get('confidence', 'low')} confidence) | {quality['reason']}",
+        ]
+        if candidate.get("path") == (self.pack_analysis or {}).get("install_inf_mapping", {}).get(slot_key):
+            lines.append("This path is also backed by install.inf for the slot.")
+        if candidate.get("low_priority_hits"):
+            lines.append("Folder priority penalty: candidate lives under generated/temp-style folders.")
+        if int(candidate.get("depth", 0)) > 0:
+            lines.append(f"Depth tie-break: nested {candidate['depth']} folder level(s) below the pack root.")
+        if candidate.get("warnings"):
+            lines.append("Candidate warnings: " + "; ".join(candidate["warnings"][:3]))
+        ambiguous_paths = {item["path"] for item in self._ambiguous_candidates_for_slot(slot_key)}
+        if candidate.get("path") in ambiguous_paths:
+            lines.append("Ambiguity: this slot is effectively near-tied and should be judged visually.")
+        return "\n".join(f"- {line}" for line in lines)
+
+    def _current_choice_text(self, slot_key: str, current_path: str, quality: dict, selected_candidate: dict | None) -> str:
+        context = self._selection_context_for_slot(slot_key, current_path)
+        lines = []
+        if context is None:
+            return "No current slot assignment."
+        lines.append(f"Origin: {self._selection_origin_label(context.get('origin', 'unknown'))}")
+        lines.append(f"Why it was chosen: {context.get('reason', 'No extra provenance recorded.')}")
+        current_candidate = self._candidate_for_slot_path(slot_key, current_path)
+        leader = self._slot_candidates(slot_key)[0] if self._slot_candidates(slot_key) else None
+        if current_candidate is not None:
+            lines.append(
+                f"Current ranking: #{current_candidate.get('rank', '--')} | score {current_candidate.get('score', '--')} | "
+                f"{summarize_match_details(current_candidate.get('match_details', {}))}"
+            )
+            if leader is not None and leader.get("path") != current_path:
+                lines.append(
+                    f"Why it is not the leader: {candidate_rank_gap_reason(current_candidate, leader)}."
+                )
+        elif context.get("origin") == "inf":
+            lines.append("This choice can stay selected even when another filename scores higher, because install.inf pinned it.")
+        elif context.get("origin") == "fallback":
+            source_slot = context.get("source_slot")
+            if source_slot in SLOT_BY_KEY:
+                lines.append(f"It currently reuses {SLOT_BY_KEY[source_slot]['label']} art as a fallback.")
+        if selected_candidate is not None and selected_candidate.get("path") != current_path:
+            lines.append(
+                f"Selected alternate: {Path(selected_candidate['path']).name} | "
+                f"{candidate_rank_gap_reason(selected_candidate, leader)}"
+            )
+        lines.append(
+            f"Decision guidance: {quality['decision']} | {quality['label']} ({quality.get('confidence', 'low')} confidence)"
+        )
+        return "\n".join(f"- {line}" for line in lines)
+
+    def _slot_guidance_text(self, slot_key: str, summary: dict, quality: dict) -> str:
+        context = self._selection_context_for_slot(slot_key, summary.get("path"))
+        lines = [
+            "Forecast:",
+            f"- {quality['label']} ({quality.get('confidence', 'low')} confidence): {quality['reason']}",
+            "",
+            "Choice provenance:",
+            f"- {self._selection_origin_label((context or {}).get('origin', 'unknown'))}: {(context or {}).get('reason', 'No provenance recorded.')}",
+            "",
+            "Warnings:",
+        ]
+        warning_lines = quality["warnings"] or ["No immediate warnings."]
+        for warning in warning_lines:
+            lines.append(f"- {warning}")
+        if summary.get("hotspot_summary"):
+            lines.append(f"- Hotspot summary: {summary['hotspot_summary']}")
+        lines.extend(["", "Recommended actions:"])
+        for action in quality["actions"]:
+            lines.append(f"- {action}")
+        return "\n".join(lines)
+
+    def _build_analysis_action_items(self) -> list[dict]:
+        analysis = self.pack_analysis
+        if analysis is None:
+            return []
+
+        items: list[dict] = []
+        if analysis.get("install_inf") is None:
+            items.append(
+                {
+                    "title": "No install.inf guidance",
+                    "severity": "warn",
+                    "category": "Pack",
+                    "target": "Candidate review",
+                    "next": "Review ranked slots",
+                    "detail": "Auto-fill must lean entirely on filename heuristics, so slot review matters more than usual.",
+                    "action": {"kind": "open_review"},
+                }
+            )
+
+        hidpi = analysis.get("hidpi_potential", {})
+        if hidpi.get("rating") in {"weak", "limited"}:
+            items.append(
+                {
+                    "title": "Weak HiDPI coverage",
+                    "severity": "warn",
+                    "category": "Build",
+                    "target": "Preset guidance",
+                    "next": f"Apply {SAFE_PRESET_LABEL}",
+                    "detail": (
+                        f"Only {hidpi.get('supports_96_count', 0)} asset(s) reach 96px native detail. "
+                        "Large presets will upscale heavily unless you redraw weak slots."
+                    ),
+                    "action": {"kind": "open_build"},
+                    "compare_action": {"kind": "compare_preset", "preset": SAFE_PRESET_LABEL},
+                    "suggested_preset": SAFE_PRESET_LABEL,
+                }
+            )
+
+        for slot_key, candidates in sorted(analysis.get("ambiguous_candidates", {}).items()):
+            alternate_path = candidates[1]["path"] if len(candidates) > 1 else candidates[0]["path"]
+            items.append(
+                {
+                    "title": f"{SLOT_BY_KEY[slot_key]['label']} is ambiguous",
+                    "severity": "warn",
+                    "category": "Slot",
+                    "target": SLOT_BY_KEY[slot_key]["label"],
+                    "next": "Compare top candidates",
+                    "detail": (
+                        "Top filename candidates are near-tied here. Review the slot and compare the strongest options visually."
+                    ),
+                    "action": {"kind": "review_slot", "slot_key": slot_key, "candidate_path": candidates[0]["path"]},
+                    "compare_action": {
+                        "kind": "compare_slot",
+                        "slot_key": slot_key,
+                        "candidate_path": alternate_path,
+                    },
+                }
+            )
+
+        for slot in SLOT_DEFS:
+            candidates = self._slot_candidates(slot["key"])
+            if not candidates:
+                continue
+            top_candidate = candidates[0]
+            if int(top_candidate.get("low_priority_hits", 0)) > 0:
+                items.append(
+                    {
+                        "title": f"{slot['label']} leans on generated folders",
+                        "severity": "warn",
+                        "category": "Candidate",
+                        "target": slot["label"],
+                        "next": "Review candidate origin",
+                        "detail": (
+                            f"The top-ranked candidate for {slot['label']} comes from a tmp/build/cache-style path. "
+                            "Compare it against a cleaner source before locking the slot."
+                        ),
+                        "action": {
+                            "kind": "review_slot",
+                            "slot_key": slot["key"],
+                            "candidate_path": top_candidate["path"],
+                        },
+                        "compare_action": {
+                            "kind": "compare_slot",
+                            "slot_key": slot["key"],
+                            "candidate_path": top_candidate["path"],
+                        },
+                    }
+                )
+
+        error_assets = [asset for asset in analysis.get("asset_summaries", []) if asset.get("error")]
+        if error_assets:
+            items.append(
+                {
+                    "title": "Some assets failed inspection",
+                    "severity": "warn",
+                    "category": "Assets",
+                    "target": f"{len(error_assets)} file(s)",
+                    "next": "Open asset list",
+                    "detail": "At least one source file could not be inspected cleanly. Double-click it in the asset list and replace it if needed.",
+                    "action": {"kind": "open_analysis"},
+                }
+            )
+
+        return items
+
+    def _populate_analysis_action_tree(self) -> None:
+        for item in self.analysis_action_tree.get_children():
+            self.analysis_action_tree.delete(item)
+        self.analysis_action_items = {}
+        for index, item in enumerate(self._build_analysis_action_items(), start=1):
+            iid = f"analysis-action-{index}"
+            self.analysis_action_items[iid] = item
+            self.analysis_action_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                text=item["title"],
+                values=(item["severity"], item["category"], item["target"], item["next"]),
+            )
+        children = self.analysis_action_tree.get_children()
+        if children:
+            self.analysis_action_tree.selection_set(children[0])
+        else:
+            self.analysis_action_detail_var.set("No action items. The pack analysis looks straightforward so far.")
+
+    def _selected_analysis_action_item(self) -> dict | None:
+        selection = self.analysis_action_tree.selection()
+        if not selection:
+            return None
+        return self.analysis_action_items.get(selection[0])
+
+    def _refresh_analysis_action_detail(self) -> None:
+        item = self._selected_analysis_action_item()
+        if item is None:
+            self.analysis_action_detail_var.set("Select an action item to see why it matters.")
+            return
+        self.analysis_action_detail_var.set(item["detail"])
+
+    def _select_candidate_in_tree(self, candidate_path: str | None) -> None:
+        if not candidate_path:
+            return
+        if candidate_path in self.candidate_tree.get_children():
+            self.candidate_tree.selection_set(candidate_path)
+            self.candidate_tree.focus(candidate_path)
+            self.candidate_tree.see(candidate_path)
+            self._refresh_candidate_detail()
+
+    def _perform_analysis_action(self, action: dict | None) -> None:
+        if action is None:
+            return
+        kind = action.get("kind")
+        if kind == "open_analysis":
+            self.notebook.select(self.analysis_tab)
+            return
+        if kind == "open_build":
+            self.notebook.select(self.build_tab)
+            return
+        if kind == "open_review":
+            self.notebook.select(self.review_tab)
+            return
+        if kind == "review_slot":
+            slot_key = action["slot_key"]
+            self.focus_slot_candidates(slot_key)
+            self.review_tool_notebook.select(self.candidate_browser_tab)
+            self._select_candidate_in_tree(action.get("candidate_path"))
+            return
+        if kind == "compare_slot":
+            self.open_compare_view(
+                mode=COMPARE_MODE_CURRENT_VS_CANDIDATE,
+                slot_key=action["slot_key"],
+                candidate_path=action.get("candidate_path"),
+            )
+            return
+        if kind == "compare_preset":
+            self.open_compare_view(
+                mode=COMPARE_MODE_PRESET,
+                preset_label=action.get("preset", SAFE_PRESET_LABEL),
+            )
+
+    def _run_selected_analysis_action(self) -> None:
+        item = self._selected_analysis_action_item()
+        if item is None:
+            return
+        self._perform_analysis_action(item.get("action"))
+
+    def _run_selected_analysis_compare_action(self) -> None:
+        item = self._selected_analysis_action_item()
+        if item is None:
+            return
+        action = item.get("compare_action")
+        if action is None:
+            self.analysis_action_detail_var.set(item["detail"] + " No compare action is available for this item yet.")
+            return
+        self._perform_analysis_action(action)
+
+    def _apply_selected_analysis_preset(self) -> None:
+        item = self._selected_analysis_action_item()
+        if item is None:
+            return
+        preset_label = item.get("suggested_preset")
+        if not preset_label:
+            self.analysis_action_detail_var.set(item["detail"] + " No preset change is suggested for this item.")
+            return
+        self.build_preset_var.set(preset_label)
+        self.apply_selected_preset()
+        self.notebook.select(self.build_tab)
+
+    def _review_selected_analysis_asset(self) -> None:
+        selection = self.analysis_asset_tree.selection()
+        if not selection:
+            return
+        asset_path = selection[0]
+        for slot in SLOT_DEFS:
+            candidate = self._candidate_for_slot_path(slot["key"], asset_path)
+            if candidate is not None:
+                self.focus_slot_candidates(slot["key"])
+                self.review_tool_notebook.select(self.candidate_browser_tab)
+                self._select_candidate_in_tree(asset_path)
+                return
+        for slot in SLOT_DEFS:
+            if self.slot_paths.get(slot["key"], "").strip() == asset_path:
+                self.focus_slot_candidates(slot["key"])
+                return
+        self.set_status(f"No slot context found yet for {Path(asset_path).name}")
+
+    def _render_preview_payload_into_panel(self, panel: AnimationPreviewPanel, payload: dict, box_size: int) -> None:
+        self._apply_preview_panel_payload(panel, payload)
+
+    def _prepare_custom_output_preview_payload(self, source_path: Path, sizes: list[int], scale_filter: str) -> dict:
+        preview = load_cached_output_preview(
+            source_path,
+            self.current_preview_root(),
+            sizes,
+            scale_filter,
+            self.current_preview_nominal_size(),
+            self.source_metadata_cache,
+            self.output_preview_cache,
+        )
+        frames = preview["frames"]
+        if not frames:
+            return {"reason": "No predicted frames available", "preview": None}
+        total_ms = sum(int(frame.get("delay_ms", 50)) for frame in frames)
+        first = frames[0]
+        frame_info = (
+            f"Nominal size {preview['preview_nominal_size']}px | emitted PNG {first['width']}x{first['height']} | "
+            f"filter {preview['scale_filter']}"
+        )
+        return {
+            "reason": None,
+            "preview": build_animation_preview_payload(
+                frames,
+                self.current_preview_root(),
+                PLAYER_PREVIEW_SIZE,
+                summary=f"{len(frames)} frame(s) | {format_duration_ms(total_ms)} total | built path preview",
+                frame_info=frame_info,
+            ),
+        }
+
+    def _default_compare_candidate_path(self) -> str | None:
+        current_path = self._selected_slot_path()
+        candidates = self._slot_candidates(self.selected_slot_key)
+        if not candidates:
+            return None
+        if not current_path:
+            top_path = candidates[0]["path"]
+            if self.selected_candidate_path and self.selected_candidate_path != top_path:
+                return self.selected_candidate_path
+            if len(candidates) > 1:
+                return candidates[1]["path"]
+            return top_path
+        if self.selected_candidate_path and self.selected_candidate_path != current_path:
+            return self.selected_candidate_path
+        for candidate in candidates:
+            if candidate.get("path") != current_path:
+                return candidate["path"]
+        return None
+
+    def _replay_compare_panels(self) -> None:
+        self.compare_left_panel.replay()
+        self.compare_right_panel.replay()
+
+    def open_compare_view(
+        self,
+        *,
+        mode: str | None = None,
+        slot_key: str | None = None,
+        candidate_path: str | None = None,
+        preset_label: str | None = None,
+    ) -> None:
+        if slot_key is not None and slot_key != self.selected_slot_key:
+            self.select_slot(slot_key)
+        if candidate_path:
+            self._select_candidate_in_tree(candidate_path)
+        if preset_label:
+            self.compare_preset_var.set(preset_label)
+        if mode:
+            self.compare_mode_var.set(mode)
+        elif self.compare_mode_var.get() == COMPARE_MODE_CURRENT_VS_CANDIDATE and not self._default_compare_candidate_path():
+            self.compare_mode_var.set(COMPARE_MODE_SOURCE_VS_OUTPUT)
+        self.notebook.select(self.review_tab)
+        self.review_tool_notebook.select(self.compare_tab)
+        self._refresh_compare_view()
+
+    def _refresh_compare_view(self) -> None:
+        if not hasattr(self, "compare_left_panel"):
+            return
+        mode = self.compare_mode_var.get().strip() or COMPARE_MODE_CURRENT_VS_CANDIDATE
+        if mode == COMPARE_MODE_PRESET:
+            self.compare_preset_combo.configure(state="readonly")
+        else:
+            self.compare_preset_combo.configure(state="disabled")
+
+        slot_label = SLOT_BY_KEY[self.selected_slot_key]["label"]
+        try:
+            if mode == COMPARE_MODE_CURRENT_VS_CANDIDATE:
+                current_path = self._selected_slot_path()
+                left_title = "Current Selection"
+                if not current_path:
+                    candidates = self._slot_candidates(self.selected_slot_key)
+                    if not candidates:
+                        self.compare_summary_var.set("Select a slot first.")
+                        self.compare_hint_var.set("Compare mode uses the currently selected slot as its baseline.")
+                        self.compare_left_panel.clear("No slot selected")
+                        self.compare_right_panel.clear("No slot selected")
+                        return
+                    current_path = candidates[0]["path"]
+                    left_title = "Top Candidate"
+                source_path = Path(current_path)
+                alternate_path = self._default_compare_candidate_path()
+                self.compare_left_panel.set_title(left_title)
+                self.compare_right_panel.set_title("Alternate Candidate")
+                left_payload = prepare_source_preview_payload(
+                    source_path,
+                    self.current_preview_root(),
+                    self.current_preview_nominal_size(),
+                    self.source_metadata_cache,
+                )
+                self._render_preview_payload_into_panel(self.compare_left_panel, left_payload, PLAYER_PREVIEW_SIZE)
+                if not alternate_path:
+                    self.compare_right_panel.clear("No alternate candidate available")
+                    self.compare_summary_var.set(f"Compare current vs candidate for {slot_label}.")
+                    self.compare_hint_var.set("This slot currently has no alternate ranked candidate to compare against.")
+                    return
+                alternate_source = Path(alternate_path)
+                right_payload = prepare_source_preview_payload(
+                    alternate_source,
+                    self.current_preview_root(),
+                    self.current_preview_nominal_size(),
+                    self.source_metadata_cache,
+                )
+                self._render_preview_payload_into_panel(self.compare_right_panel, right_payload, PLAYER_PREVIEW_SIZE)
+                current_quality = self._slot_quality(self.selected_slot_key, current_path) or {}
+                alternate_quality = self._slot_quality(self.selected_slot_key, alternate_path) or {}
+                alternate_candidate = self._candidate_for_slot_path(self.selected_slot_key, alternate_path) or {}
+                self.compare_summary_var.set(f"Comparing the current {slot_label} assignment against a ranked alternate.")
+                self.compare_hint_var.set(
+                    f"Current: {Path(current_path).name} [{current_quality.get('label', '--')}]. "
+                    f"Alternate: {Path(alternate_path).name} [rank #{alternate_candidate.get('rank', '--')}, "
+                    f"{alternate_quality.get('label', '--')}]."
+                )
+                return
+
+            current_path = self._selected_slot_path()
+            if not current_path:
+                self.compare_summary_var.set("Select a slot first.")
+                self.compare_hint_var.set("Compare mode uses the currently selected slot as its baseline.")
+                self.compare_left_panel.clear("No slot selected")
+                self.compare_right_panel.clear("No slot selected")
+                return
+            source_path = Path(current_path)
+
+            if mode == COMPARE_MODE_SOURCE_VS_OUTPUT:
+                self.compare_left_panel.set_title("Source Preview")
+                self.compare_right_panel.set_title("Predicted Linux Output")
+                left_payload = prepare_source_preview_payload(
+                    source_path,
+                    self.current_preview_root(),
+                    self.current_preview_nominal_size(),
+                    self.source_metadata_cache,
+                )
+                right_payload = prepare_output_preview_payload(
+                    source_path,
+                    self.current_preview_root(),
+                    self.current_preview_nominal_size(),
+                    self.try_target_sizes()[0],
+                    self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER,
+                    self.source_metadata_cache,
+                    self.output_preview_cache,
+                )
+                self._render_preview_payload_into_panel(self.compare_left_panel, left_payload, PLAYER_PREVIEW_SIZE)
+                self._render_preview_payload_into_panel(self.compare_right_panel, right_payload, PLAYER_PREVIEW_SIZE)
+                self.compare_summary_var.set(f"Comparing source timing and art against the predicted Linux output for {slot_label}.")
+                self.compare_hint_var.set(
+                    "Use this view to catch upscale softness, non-square output behavior, timing changes, and hotspot issues before export."
+                )
+                return
+
+            compare_preset = resolve_build_preset(self.compare_preset_var.get().strip() or SAFE_PRESET_LABEL)
+            current_sizes = self.try_target_sizes()[0]
+            current_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
+            self.compare_left_panel.set_title(f"Current Build ({self.build_preset_var.get() or 'Custom'})")
+            self.compare_right_panel.set_title(f"Compare Preset ({compare_preset['label']})")
+            left_payload = self._prepare_custom_output_preview_payload(source_path, current_sizes, current_filter)
+            right_payload = self._prepare_custom_output_preview_payload(
+                source_path,
+                compare_preset["target_sizes"],
+                compare_preset["scale_filter"],
+            )
+            self._render_preview_payload_into_panel(self.compare_left_panel, left_payload, PLAYER_PREVIEW_SIZE)
+            self._render_preview_payload_into_panel(self.compare_right_panel, right_payload, PLAYER_PREVIEW_SIZE)
+            summary = self.ensure_summary(source_path)
+            current_quality = evaluate_quality_forecast(
+                self.selected_slot_key,
+                summary,
+                current_sizes,
+                self.pack_analysis,
+                selection_context=self._selection_context_for_slot(self.selected_slot_key, current_path),
+            )
+            preset_quality = evaluate_quality_forecast(
+                self.selected_slot_key,
+                summary,
+                compare_preset["target_sizes"],
+                self.pack_analysis,
+                selection_context=self._selection_context_for_slot(self.selected_slot_key, current_path),
+            )
+            self.compare_summary_var.set(
+                f"Comparing current build settings against {compare_preset['label']} for {slot_label}."
+            )
+            self.compare_hint_var.set(
+                f"Current forecast: {current_quality['label']} ({current_quality['confidence']} confidence). "
+                f"{compare_preset['label']}: {preset_quality['label']} ({preset_quality['confidence']} confidence)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.compare_summary_var.set("Unable to build the requested compare preview.")
+            self.compare_hint_var.set(str(exc))
+            self.compare_left_panel.clear(str(exc))
+            self.compare_right_panel.clear(str(exc))
+
+    def review_most_at_risk_slot(self) -> None:
+        ranked_slots = []
+        for slot in SLOT_DEFS:
+            path = self.slot_paths.get(slot["key"], "").strip()
+            if not path:
+                continue
+            quality = self._slot_quality(slot["key"], path)
+            if quality is None:
+                continue
+            ranked_slots.append((quality_to_score(quality["label"]), slot["key"], quality))
+        if not ranked_slots:
+            self.set_status("No assigned slots to review yet.")
+            return
+        ranked_slots.sort(key=lambda item: (item[0], item[1]))
+        weakest_slot = ranked_slots[0][1]
+        self.focus_slot_candidates(weakest_slot)
+        self.open_compare_view()
+
+    def apply_safe_preset(self) -> None:
+        self.build_preset_var.set(SAFE_PRESET_LABEL)
+        self.apply_selected_preset()
+
+    def _update_busy_buttons(self) -> None:
+        analysis_state = "disabled" if (self.analysis_busy or self.auto_prepare_busy) else "normal"
+        build_state = "disabled" if self.build_busy else "normal"
+        for button_name in ("analyze_button", "auto_fill_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.configure(state=analysis_state)
+        if getattr(self, "build_button", None) is not None:
+            self.build_button.configure(state=build_state)
+
+    def _set_analysis_busy(self, is_busy: bool, status_message: str | None = None) -> None:
+        self.analysis_busy = is_busy
+        self._update_busy_buttons()
+        if status_message is not None:
+            self.set_status(status_message)
+
+    def _set_auto_prepare_busy(self, is_busy: bool, status_message: str | None = None) -> None:
+        self.auto_prepare_busy = is_busy
+        self._update_busy_buttons()
+        if status_message is not None:
+            self.set_status(status_message)
+
+    def _set_build_busy(self, is_busy: bool, status_message: str | None = None) -> None:
+        self.build_busy = is_busy
+        self._update_busy_buttons()
+        if status_message is not None:
+            self.set_status(status_message)
+
     def _sync_preset_from_settings(self) -> None:
         sizes, _error = self.try_target_sizes()
         current_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
@@ -1486,71 +3521,83 @@ class MappingApp:
         self.root.update_idletasks()
 
     def current_preview_root(self) -> Path:
-        work_root = Path(self.work_root_var.get().strip() or DEFAULT_WORK_ROOT).expanduser()
+        work_root = normalize_path(Path(self.work_root_var.get().strip() or DEFAULT_WORK_ROOT))
         return work_root / "_preview-cache"
 
     def preview_photo(self, png_path: Path, box_size: int) -> tk.PhotoImage:
-        resolved = png_path.expanduser().resolve()
-        key = f"{resolved}::{file_cache_token(resolved)}::{box_size}"
-        if key in self.preview_photo_cache:
-            return self.preview_photo_cache[key]
-        preview_png = render_preview_thumbnail(resolved, self.current_preview_root() / "_thumbs", box_size)
-        image = tk.PhotoImage(file=str(preview_png))
-        self.preview_photo_cache[key] = image
-        return image
-
-    def _source_metadata_cache_key(self, source_path: Path) -> str:
-        resolved = source_path.expanduser().resolve()
         preview_root = self.current_preview_root()
-        return f"{resolved}::{file_cache_token(resolved)}::{preview_root}"
+        preview_png = render_preview_thumbnail(normalize_path(png_path), preview_root / "_thumbs", box_size)
+        return self.preview_photo_from_path(preview_png, box_size)
+
+    def preview_photo_from_path(self, preview_png: Path, box_size: int) -> tk.PhotoImage:
+        resolved_text, cache_token = file_identity(preview_png)
+        key = ("preview-photo", resolved_text, cache_token, int(box_size))
+        cached = self.preview_photo_cache.get(key)
+        if cached is not None:
+            return cached
+        image = tk.PhotoImage(file=str(preview_png))
+        return self.preview_photo_cache.set(key, image)
+
+    def _source_metadata_cache_key(self, source_path: Path) -> tuple:
+        return source_metadata_cache_key_for(normalize_path(source_path), self.current_preview_root())
+
+    def _summary_cache_key(self, source_path: Path) -> tuple:
+        return summary_cache_key_for(normalize_path(source_path), self.current_preview_root())
+
+    def _output_preview_cache_key(self, source_path: Path, sizes: list[int], filter_name: str, preview_nominal_size: int) -> tuple:
+        return output_preview_cache_key_for(
+            normalize_path(source_path),
+            self.current_preview_root(),
+            sizes,
+            filter_name,
+            preview_nominal_size,
+        )
+
+    def _touch_source_preview_artifacts(self, source_path: Path) -> None:
+        touch_source_preview_artifacts(self.current_preview_root(), normalize_path(source_path))
+
+    def _touch_output_preview_artifacts(self, preview: dict) -> None:
+        touch_output_preview_artifacts(self.current_preview_root(), preview)
+
+    def invalidate_source_caches(self, *paths: str | Path) -> None:
+        normalized_paths = {
+            str(normalize_path(Path(path)))
+            for path in paths
+            if str(path).strip()
+        }
+        if not normalized_paths:
+            return
+
+        self.source_metadata_cache.discard_where(lambda key, _value: len(key) > 1 and key[1] in normalized_paths)
+        self.summary_cache.discard_where(lambda key, _value: len(key) > 1 and key[1] in normalized_paths)
+        self.output_preview_cache.discard_where(lambda key, _value: len(key) > 1 and key[1] in normalized_paths)
 
     def ensure_source_metadata(self, source_path: Path) -> dict:
-        cache_key = self._source_metadata_cache_key(source_path)
-        if cache_key in self.source_metadata_cache:
-            return self.source_metadata_cache[cache_key]
-        metadata = load_source_metadata(source_path.expanduser().resolve(), self.current_preview_root() / "_source")
-        self.source_metadata_cache[cache_key] = metadata
-        return metadata
+        return load_cached_source_metadata(source_path, self.current_preview_root(), self.source_metadata_cache)
 
     def ensure_summary(self, source_path: Path) -> dict:
-        resolved = source_path.expanduser().resolve()
-        cache_key = self._source_metadata_cache_key(resolved)
-        if cache_key in self.summary_cache:
-            return self.summary_cache[cache_key]
-        metadata = self.ensure_source_metadata(resolved)
-        summary = summarize_metadata(resolved, metadata)
-        if self.pack_analysis is not None:
-            for asset in self.pack_analysis.get("asset_summaries", []):
-                if asset["path"] == str(resolved):
-                    summary["warnings"] = list(dict.fromkeys(asset.get("warnings", [])))
-                    summary["relative_path"] = asset.get("relative_path", summary["relative_path"])
-                    summary["source_type"] = asset.get("source_type", summary["source_type"])
-                    summary["largest_native_size"] = asset.get("largest_native_size", summary["largest_native_size"])
-                    summary["size_summary"] = asset.get("size_summary", summary["size_summary"])
-                    summary["contains_non_square"] = asset.get("contains_non_square", summary["contains_non_square"])
-                    break
-        self.summary_cache[cache_key] = summary
-        return summary
+        normalized = normalize_path(source_path)
+        return load_cached_summary(
+            normalized,
+            self.current_preview_root(),
+            self.source_metadata_cache,
+            self.summary_cache,
+            asset_summary=self.pack_asset_lookup.get(str(normalized)),
+        )
 
     def ensure_output_preview(self, source_path: Path, preview_nominal_size: int | None = None) -> dict:
         sizes = self.try_target_sizes()[0]
         filter_name = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
-        resolved = source_path.expanduser().resolve()
-        cache_key = (
-            f"{resolved}::{file_cache_token(resolved)}::{format_cursor_sizes(sizes)}::"
-            f"{filter_name}::{preview_nominal_size or self.preview_nominal_size_var.get()}::{self.current_preview_root()}"
-        )
-        if cache_key in self.output_preview_cache:
-            return self.output_preview_cache[cache_key]
-        preview = prepare_output_preview_metadata(
-            resolved,
-            self.current_preview_root() / "_output",
+        selected_preview_size = int(preview_nominal_size or self.current_preview_nominal_size())
+        return load_cached_output_preview(
+            source_path,
+            self.current_preview_root(),
             sizes,
-            scale_filter=filter_name,
-            preview_nominal_size=preview_nominal_size,
+            filter_name,
+            selected_preview_size,
+            self.source_metadata_cache,
+            self.output_preview_cache,
         )
-        self.output_preview_cache[cache_key] = preview
-        return preview
 
     def try_target_sizes(self) -> tuple[list[int], str | None]:
         try:
@@ -1589,24 +3636,35 @@ class MappingApp:
         self.build_preview_size_combo.configure(values=values)
         current = self.preview_nominal_size_var.get().strip()
         if current not in values:
-            self.preview_nominal_size_var.set(str(self._default_preview_size(sizes)))
+            self._suspend_refresh_traces = True
+            try:
+                self.preview_nominal_size_var.set(str(self._default_preview_size(sizes)))
+            finally:
+                self._suspend_refresh_traces = False
 
     def choose_source_dir(self) -> None:
         selected = filedialog.askdirectory(title="Choose Windows cursor folder")
         if not selected:
             return
-        self.source_dir_var.set(selected)
+        previous_value = self.source_dir_var.get().strip()
+        normalized_selected = str(normalize_path(Path(selected)))
+        self.source_dir_var.set(normalized_selected)
+        if not previous_value or normalize_path(Path(previous_value)) != Path(normalized_selected):
+            self._set_pack_analysis(None)
+            self.slot_selection_context.clear()
+            self.summary_cache.clear()
+            self._refresh_all_views()
         if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
-            self.theme_name_var.set(slugify_name(Path(selected).name))
-        self.set_status(f"Selected source pack: {selected}")
+            self.theme_name_var.set(slugify_name(Path(normalized_selected).name))
+        self.set_status(f"Selected source pack: {normalized_selected}")
 
     def choose_work_root(self) -> None:
         selected = filedialog.askdirectory(title="Choose output root")
         if not selected:
             return
-        self.work_root_var.set(selected)
+        self.work_root_var.set(str(normalize_path(Path(selected))))
         self.clear_preview_caches()
-        self.set_status(f"Selected output root: {selected}")
+        self.set_status(f"Selected output root: {self.work_root_var.get()}")
         self._refresh_all_views()
 
     def clear_preview_caches(self) -> None:
@@ -1614,6 +3672,14 @@ class MappingApp:
         self.source_metadata_cache.clear()
         self.output_preview_cache.clear()
         self.summary_cache.clear()
+
+    def _set_analysis_loading(self, message: str) -> None:
+        set_readonly_text(self.analysis_detail_text, message)
+        if hasattr(self, "analysis_action_detail_var"):
+            self.analysis_action_detail_var.set(message)
+        if hasattr(self, "analysis_action_tree"):
+            for item in self.analysis_action_tree.get_children():
+                self.analysis_action_tree.delete(item)
 
     def analyze_pack(self) -> None:
         source_dir_text = self.source_dir_var.get().strip()
@@ -1624,15 +3690,37 @@ class MappingApp:
         if not source_dir.exists():
             messagebox.showerror("Missing source folder", f"Folder does not exist:\n{source_dir}")
             return
-        try:
-            self.set_status(f"Analyzing {source_dir}")
-            self.pack_analysis = analyze_cursor_pack(source_dir)
-            self.set_status(f"Analyzed {self.pack_analysis['counts']['total']} source assets")
+        self._set_analysis_busy(True, f"Analyzing {source_dir}")
+        self._set_analysis_loading("Analyzing pack...")
+        token = self.request_tracker.next("pack-analysis")
+
+        def work() -> dict:
+            return analyze_cursor_pack(source_dir)
+
+        def on_success(result_token: TaskToken, analysis: dict) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            self._set_analysis_busy(False)
+            self._set_pack_analysis(analysis)
+            self.slot_selection_context = {
+                slot["key"]: self._infer_selection_context(slot["key"], path)
+                for slot in SLOT_DEFS
+                for path in [self.slot_paths.get(slot["key"], "").strip()]
+                if path
+            }
+            self.summary_cache.clear()
+            self.set_status(f"Analyzed {analysis['counts']['total']} source assets")
             self._render_pack_analysis()
             self._refresh_all_views()
-        except Exception as exc:  # noqa: BLE001
-            self.set_status("Pack analysis failed")
+
+        def on_error(result_token: TaskToken, exc: BaseException) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            self._set_analysis_busy(False, "Pack analysis failed")
+            self._render_pack_analysis()
             messagebox.showerror("Pack analysis failed", str(exc))
+
+        self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
 
     def _render_pack_analysis(self) -> None:
         analysis = self.pack_analysis
@@ -1651,6 +3739,10 @@ class MappingApp:
             self.analysis_attention_value_var.set("--")
             self.analysis_attention_note_var.set("Warnings and ambiguity")
             set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
+            self.analysis_action_detail_var.set("Analyze a pack to build an action queue.")
+            self.analysis_action_items = {}
+            for item in self.analysis_action_tree.get_children():
+                self.analysis_action_tree.delete(item)
             for item in self.analysis_asset_tree.get_children():
                 self.analysis_asset_tree.delete(item)
             return
@@ -1659,6 +3751,7 @@ class MappingApp:
         warning_count = len(analysis.get("warnings", []))
         ambiguous_count = len(analysis.get("ambiguous_candidates", {}))
         duplicate_count = len(analysis.get("duplicate_artifacts", []))
+        action_count = len(self._build_analysis_action_items())
         self.analysis_counts_var.set(
             f"Files: {counts['total']} total | {counts['cur']} .cur | {counts['ani']} .ani | {counts['png']} .png"
         )
@@ -1689,28 +3782,32 @@ class MappingApp:
         self.analysis_hidpi_value_var.set(str(analysis["hidpi_potential"]["rating"]).upper())
         largest_sizes = ", ".join(str(size) for size in analysis["largest_native_sizes_found"][:4]) or "--"
         self.analysis_hidpi_note_var.set(f"Top native sizes: {largest_sizes}")
-        self.analysis_attention_value_var.set(str(warning_count + ambiguous_count))
+        self.analysis_attention_value_var.set(str(action_count))
         self.analysis_attention_note_var.set(
-            f"{warning_count} warning(s), {ambiguous_count} ambiguous slot(s), {duplicate_count} duplicate/temp artifact(s)"
+            f"{warning_count} warning(s), {ambiguous_count} ambiguous slot(s), {duplicate_count} duplicate/temp artifact(s), {action_count} action item(s)"
         )
 
-        warning_lines = []
+        warning_lines = ["Pack outlook:"]
         if analysis.get("warnings"):
-            warning_lines.append("Warnings:")
             warning_lines.extend(f"- {warning}" for warning in analysis["warnings"])
+        else:
+            warning_lines.append("- No immediate pack-level warnings.")
+        ambiguous_items = analysis.get("ambiguous_candidates", {})
+        if ambiguous_items:
             warning_lines.append("")
-        if analysis.get("ambiguous_candidates"):
-            warning_lines.append("Ambiguous slots:")
-            for slot_key, candidates in sorted(analysis["ambiguous_candidates"].items()):
+            warning_lines.append("Immediate review targets:")
+            for slot_key, candidates in sorted(ambiguous_items.items()):
                 labels = ", ".join(Path(candidate["path"]).name for candidate in candidates[:3])
-                warning_lines.append(f"- {SLOT_BY_KEY[slot_key]['label']}: {labels}")
-            warning_lines.append("")
+                warning_lines.append(f"- {SLOT_BY_KEY[slot_key]['label']}: compare {labels}")
         duplicate_artifacts = analysis.get("duplicate_artifacts", [])
         if duplicate_artifacts:
-            warning_lines.append("Duplicate / temp-style artifacts:")
-            for artifact in duplicate_artifacts[:8]:
-                warning_lines.append(f"- {artifact['relative_path']} ({artifact['reason']})")
-        set_readonly_text(self.analysis_detail_text, "\n".join(warning_lines) or "No pack-level warnings.")
+            warning_lines.append("")
+            warning_lines.append("Generated/duplicate risk:")
+            warning_lines.extend(
+                f"- {artifact['relative_path']} ({artifact['reason']})"
+                for artifact in duplicate_artifacts[:6]
+            )
+        set_readonly_text(self.analysis_detail_text, "\n".join(warning_lines))
 
         for item in self.analysis_asset_tree.get_children():
             self.analysis_asset_tree.delete(item)
@@ -1722,6 +3819,7 @@ class MappingApp:
             self.analysis_asset_tree.insert(
                 "",
                 "end",
+                iid=asset["path"],
                 text=asset["filename"],
                 values=(
                     asset.get("source_type", "--"),
@@ -1731,6 +3829,8 @@ class MappingApp:
                     location,
                 ),
             )
+        self._populate_analysis_action_tree()
+        self._refresh_analysis_action_detail()
 
     def auto_prepare(self) -> None:
         source_dir = Path(self.source_dir_var.get().strip()).expanduser()
@@ -1746,14 +3846,26 @@ class MappingApp:
             return
 
         prep_dir = work_root / "_prepared" / slugify_name(source_dir.name)
-        try:
-            self.set_status(f"Preparing {source_dir.name}")
-            summary = prepare_windows_cursor_set(source_dir, prep_dir)
-            self.pack_analysis = summary.get("analysis")
+        self._set_auto_prepare_busy(True, f"Preparing {source_dir.name}")
+        self._set_analysis_loading("Analyzing pack and preparing slot mapping...")
+        token = self.request_tracker.next("auto-prepare")
+
+        def work() -> dict:
+            return prepare_windows_cursor_set(source_dir, prep_dir)
+
+        def on_success(result_token: TaskToken, summary: dict) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            self._set_auto_prepare_busy(False)
+            self._set_pack_analysis(summary.get("analysis"))
             self._render_pack_analysis()
             mapping_path = Path(summary["mapping_json"]).resolve()
             payload = load_mapping_payload(mapping_path)
             self.apply_payload(payload)
+            self._apply_prepare_selection_context(summary)
+            self._render_selected_slot_text()
+            self._refresh_candidate_detail()
+            self._refresh_build_summary()
             self.current_mapping_path = mapping_path
             if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
                 self.theme_name_var.set(slugify_name(source_dir.name))
@@ -1763,24 +3875,35 @@ class MappingApp:
                 "Auto-Fill Complete",
                 f"Prepared {summary['selected_slot_count']} slots.\n\nMapping JSON:\n{mapping_path}",
             )
-        except Exception as exc:  # noqa: BLE001
-            self.set_status("Auto-fill failed")
+
+        def on_error(result_token: TaskToken, exc: BaseException) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            self._set_auto_prepare_busy(False, "Auto-fill failed")
+            self._render_pack_analysis()
             messagebox.showerror("Auto-fill failed", str(exc))
+
+        self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
 
     def apply_payload(self, payload: dict) -> None:
         build_options = payload.get("build_options", {})
         scale_filter = build_options.get("scale_filter")
-        if scale_filter in SCALE_FILTER_CHOICES:
-            self.scale_filter_var.set(scale_filter)
         target_sizes = build_options.get("target_sizes")
         self.target_sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
-        self.target_sizes_var.set(format_cursor_sizes(self.target_sizes))
+        self._suspend_refresh_traces = True
+        try:
+            if scale_filter in SCALE_FILTER_CHOICES:
+                self.scale_filter_var.set(scale_filter)
+            self.target_sizes_var.set(format_cursor_sizes(self.target_sizes))
+        finally:
+            self._suspend_refresh_traces = False
         self._update_preview_size_choices()
         self._sync_preset_from_settings()
 
         selected = payload.get("selected_slots", {})
         role_map = payload.get("resolved_role_map", {})
         self.slot_paths = {slot["key"]: "" for slot in SLOT_DEFS}
+        self.slot_selection_context = {}
 
         for slot_key, item in selected.items():
             if slot_key in self.slot_paths:
@@ -1792,6 +3915,16 @@ class MappingApp:
                     if role in role_map:
                         self.slot_paths[slot["key"]] = role_map[role]
                         break
+
+        stored_context = payload.get("selection_context", {})
+        if isinstance(stored_context, dict):
+            for slot_key, context in stored_context.items():
+                if slot_key in self.slot_paths and self.slot_paths[slot_key]:
+                    self.slot_selection_context[slot_key] = dict(context)
+        for slot in SLOT_DEFS:
+            path = self.slot_paths.get(slot["key"], "").strip()
+            if path and slot["key"] not in self.slot_selection_context:
+                self.slot_selection_context[slot["key"]] = self._infer_selection_context(slot["key"], path)
 
         self.clear_preview_caches()
         self._refresh_all_views()
@@ -1862,7 +3995,13 @@ class MappingApp:
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
-        payload = build_payload(selected_slots, resolved, target_sizes, self.scale_filter_var.get())
+        payload = build_payload(
+            selected_slots,
+            resolved,
+            target_sizes,
+            self.scale_filter_var.get(),
+            selection_context=self._selection_context_payload(),
+        )
         target = filedialog.asksaveasfilename(
             title="Save role mapping as JSON",
             defaultextension=".json",
@@ -1911,14 +4050,20 @@ class MappingApp:
         self.notebook.select(self.review_tab)
 
     def select_slot(self, slot_key: str) -> None:
+        previous_slot = self.selected_slot_key
         self.selected_slot_key = slot_key
         self.selected_candidate_path = None
-        self._refresh_slot_cards()
+        if previous_slot in self.slot_cards:
+            self._render_slot_card(previous_slot)
+        if slot_key in self.slot_cards:
+            self._render_slot_card(slot_key)
         self._refresh_selected_slot_detail()
 
     def focus_slot_candidates(self, slot_key: str) -> None:
         self.select_slot(slot_key)
         self.notebook.select(self.review_tab)
+        if hasattr(self, "review_tool_notebook"):
+            self.review_tool_notebook.select(self.candidate_browser_tab)
 
     def browse_slot(self, slot_key: str) -> None:
         slot = SLOT_BY_KEY[slot_key]
@@ -1928,24 +4073,52 @@ class MappingApp:
         file_path = filedialog.askopenfilename(title=f"Select source for {slot['label']}", filetypes=allowed)
         if not file_path:
             return
-        self.slot_paths[slot_key] = str(Path(file_path).expanduser().resolve())
-        self.clear_preview_caches()
+        previous_path = self.slot_paths.get(slot_key, "")
+        normalized_path = str(normalize_path(Path(file_path)))
+        self.slot_paths[slot_key] = normalized_path
+        self._set_selection_context(
+            slot_key,
+            {
+                "origin": "manual-browse",
+                "path": normalized_path,
+                "reason": "Assigned manually through Browse Source.",
+            },
+        )
+        self.invalidate_source_caches(previous_path, self.slot_paths[slot_key])
         self.select_slot(slot_key)
+        self._refresh_slot_cards()
         self.set_status(f"Assigned {slot['label']} -> {file_path}")
 
     def clear_slot(self, slot_key: str) -> None:
+        previous_path = self.slot_paths.get(slot_key, "")
         self.slot_paths[slot_key] = ""
-        self.clear_preview_caches()
+        self._set_selection_context(slot_key, None)
+        self.invalidate_source_caches(previous_path)
         self.select_slot(slot_key)
+        self._refresh_slot_cards()
+        self._refresh_build_summary()
         self.set_status(f"Cleared {SLOT_BY_KEY[slot_key]['label']}")
 
     def apply_selected_candidate(self) -> None:
         if not self.selected_candidate_path:
             messagebox.showerror("No candidate selected", "Select a candidate first.")
             return
+        previous_path = self.slot_paths.get(self.selected_slot_key, "")
         self.slot_paths[self.selected_slot_key] = self.selected_candidate_path
-        self.clear_preview_caches()
+        candidate = self._candidate_for_slot_path(self.selected_slot_key, self.selected_candidate_path)
+        self._set_selection_context(
+            self.selected_slot_key,
+            {
+                "origin": "manual-candidate",
+                "path": self.selected_candidate_path,
+                "reason": "Assigned manually from the ranked candidate browser.",
+                "rank": None if candidate is None else candidate.get("rank"),
+                "score": None if candidate is None else candidate.get("score"),
+            },
+        )
+        self.invalidate_source_caches(previous_path, self.selected_candidate_path)
         self.select_slot(self.selected_slot_key)
+        self._refresh_slot_cards()
         self.set_status(
             f"Assigned {SLOT_BY_KEY[self.selected_slot_key]['label']} -> {Path(self.selected_candidate_path).name}"
         )
@@ -1953,36 +4126,170 @@ class MappingApp:
     def _slot_quality(self, slot_key: str, path: str) -> dict | None:
         if not path:
             return None
+        state = self.slot_states.get(slot_key)
+        if state is not None and state.path == path and state.quality is not None and not state.loading:
+            return state.quality
         summary = self.ensure_summary(Path(path))
         target_sizes = self.try_target_sizes()[0]
-        label, reason = score_quality(summary, target_sizes)
-        warnings = infer_slot_warnings(slot_key, summary, target_sizes, self.pack_analysis)
-        return {"label": label, "reason": reason, "warnings": warnings}
+        return build_slot_quality(
+            slot_key,
+            summary,
+            target_sizes,
+            pack_analysis=self.pack_analysis,
+            ambiguous_candidates=self._ambiguous_candidates_for_slot(slot_key),
+            selection_context=self._selection_context_for_slot(slot_key, path),
+        )
 
-    def _refresh_slot_cards(self) -> None:
-        for slot in SLOT_DEFS:
-            path = self.slot_paths.get(slot["key"], "").strip()
-            summary = None
-            quality = None
-            card = self.slot_cards[slot["key"]]
-            card.preview_image = None
-            if path:
-                try:
-                    summary = self.ensure_summary(Path(path))
-                    source_frames = frames_from_source_metadata(
-                        self.ensure_source_metadata(Path(path)),
-                        self.current_preview_nominal_size(),
-                    )
-                    if source_frames:
-                        card.preview_image = self.preview_photo(Path(source_frames[0]["png"]), CARD_PREVIEW_SIZE)
-                    quality = self._slot_quality(slot["key"], path)
-                except Exception as exc:  # noqa: BLE001
-                    summary = {"filename": Path(path).name, "warnings": [str(exc)], "path": path}
-                    quality = {"label": "redraw recommended", "reason": str(exc), "warnings": [str(exc)]}
-            card.update_card(path if path else None, summary, quality, slot["key"] == self.selected_slot_key)
+    def _slot_card_family(self, slot_key: str) -> str:
+        return f"slot-card:{slot_key}"
 
     def _selected_slot_path(self) -> str:
         return self.slot_paths.get(self.selected_slot_key, "").strip()
+
+    def _render_slot_card(self, slot_key: str) -> None:
+        state = self.slot_states[slot_key]
+        card = self.slot_cards[slot_key]
+        card.preview_image = None
+        if state.thumbnail_path and not state.loading:
+            try:
+                card.preview_image = self.preview_photo_from_path(Path(state.thumbnail_path), CARD_PREVIEW_SIZE)
+            except Exception as exc:  # noqa: BLE001
+                state.error = str(exc)
+                state.thumbnail_path = None
+
+        selected = slot_key == self.selected_slot_key
+        if not state.path:
+            card.update_card(None, None, None, selected)
+            return
+
+        if state.loading:
+            card.update_card(
+                state.path,
+                state.summary,
+                state.quality,
+                selected,
+                loading_message="Preparing source preview...",
+            )
+            return
+
+        if state.error:
+            summary = state.summary or {
+                "filename": Path(state.path).name,
+                "warnings": [state.error],
+                "path": state.path,
+                "hotspot_summary": "--",
+                "size_summary": "--",
+                "source_type": Path(state.path).suffix.lower().lstrip(".") or "unknown",
+                "is_animated": False,
+                "frame_count": 0,
+            }
+            quality = state.quality or {
+                "label": "redraw recommended",
+                "reason": state.error,
+                "warnings": [state.error],
+            }
+            card.update_card(state.path, summary, quality, selected)
+            return
+
+        card.update_card(state.path, state.summary, state.quality, selected)
+
+    def _refresh_slot_cards(self) -> None:
+        for slot in SLOT_DEFS:
+            slot_key = slot["key"]
+            path = self.slot_paths.get(slot_key, "").strip()
+            state = self.slot_states[slot_key]
+            if not path:
+                self.request_tracker.invalidate(self._slot_card_family(slot_key))
+                self.slot_states[slot_key] = SlotRenderState()
+                self._render_slot_card(slot_key)
+                continue
+
+            token = self.request_tracker.next(self._slot_card_family(slot_key))
+            state.path = path
+            state.loading = True
+            state.summary = None
+            state.quality = None
+            state.thumbnail_path = None
+            state.error = None
+            self._render_slot_card(slot_key)
+
+            preview_root = self.current_preview_root()
+            preview_nominal_size = self.current_preview_nominal_size()
+            target_sizes = self.try_target_sizes()[0]
+            asset_summary = self.pack_asset_lookup.get(path)
+            ambiguous_candidates = self._ambiguous_candidates_for_slot(slot_key)
+            pack_analysis = self.pack_analysis
+
+            def work(
+                source_path: str = path,
+                preview_root: Path = preview_root,
+                preview_nominal_size: int = preview_nominal_size,
+                target_sizes: list[int] = list(target_sizes),
+                slot_key: str = slot_key,
+                asset_summary: dict | None = asset_summary,
+                ambiguous_candidates: list[dict] = list(ambiguous_candidates),
+                pack_analysis: dict | None = pack_analysis,
+            ) -> dict:
+                return prepare_slot_card_payload(
+                    Path(source_path),
+                    preview_root,
+                    preview_nominal_size,
+                    target_sizes,
+                    slot_key,
+                    self.source_metadata_cache,
+                    self.summary_cache,
+                    pack_analysis=pack_analysis,
+                    asset_summary=asset_summary,
+                    ambiguous_candidates=ambiguous_candidates,
+                )
+
+            def on_success(
+                result_token: TaskToken,
+                payload: dict,
+                *,
+                slot_key: str = slot_key,
+                source_path: str = path,
+            ) -> None:
+                if not self.request_tracker.is_current(result_token):
+                    return
+                if self.slot_paths.get(slot_key, "").strip() != source_path:
+                    return
+                state = self.slot_states[slot_key]
+                state.path = source_path
+                state.loading = False
+                state.summary = payload["summary"]
+                state.quality = payload["quality"]
+                state.thumbnail_path = payload["thumbnail_path"]
+                state.error = None
+                self._render_slot_card(slot_key)
+                if slot_key == self.selected_slot_key:
+                    self._render_selected_slot_text()
+                self._refresh_build_summary()
+
+            def on_error(
+                result_token: TaskToken,
+                exc: BaseException,
+                *,
+                slot_key: str = slot_key,
+                source_path: str = path,
+            ) -> None:
+                if not self.request_tracker.is_current(result_token):
+                    return
+                if self.slot_paths.get(slot_key, "").strip() != source_path:
+                    return
+                state = self.slot_states[slot_key]
+                state.path = source_path
+                state.loading = False
+                state.summary = None
+                state.quality = None
+                state.thumbnail_path = None
+                state.error = str(exc)
+                self._render_slot_card(slot_key)
+                if slot_key == self.selected_slot_key:
+                    self._render_selected_slot_text()
+                self._refresh_build_summary()
+
+            self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
 
     def _refresh_selected_slot_detail(self) -> None:
         slot = SLOT_BY_KEY[self.selected_slot_key]
@@ -1991,6 +4298,7 @@ class MappingApp:
         self.selected_candidate_path = None
 
         if not path:
+            self.request_tracker.invalidate("selected-detail")
             self.selected_slot_meta_var.set("No source selected yet.")
             self.selected_slot_path_var.set("Use Auto-Fill, Browse Source, or choose a ranked candidate.")
             set_readonly_text(self.slot_warning_text, "This slot is currently unassigned.")
@@ -1998,78 +4306,137 @@ class MappingApp:
             self.output_preview_panel.clear("No source selected")
             self._populate_candidate_tree()
             self._refresh_candidate_detail()
+            self._refresh_compare_view()
             return
 
-        try:
-            source_path = Path(path)
-            summary = self.ensure_summary(source_path)
-            quality = self._slot_quality(self.selected_slot_key, path)
-            self.selected_slot_meta_var.set(
-                f"{badges_for_summary(summary)} | Quality forecast: {quality['label']} | {quality['reason']}"
-            )
-            self.selected_slot_path_var.set(compact_path(path, max_len=130))
-            warning_lines = quality["warnings"] or ["No immediate warnings."]
-            if summary.get("hotspot_summary"):
-                warning_lines.append(f"Hotspot summary: {summary['hotspot_summary']}")
-            set_readonly_text(self.slot_warning_text, "\n".join(f"- {line}" for line in warning_lines))
-            self._load_source_preview(source_path)
-            self._load_output_preview(source_path)
-        except Exception as exc:  # noqa: BLE001
-            self.selected_slot_meta_var.set("Unable to inspect the selected source.")
-            self.selected_slot_path_var.set(compact_path(path, max_len=130))
-            set_readonly_text(self.slot_warning_text, f"- {exc}")
-            self.source_preview_panel.clear(str(exc))
-            self.output_preview_panel.clear(str(exc))
-
+        self._render_selected_slot_text()
         self._populate_candidate_tree()
         self._refresh_candidate_detail()
+        self._refresh_compare_view()
 
-    def _load_source_preview(self, source_path: Path) -> None:
-        metadata = self.ensure_source_metadata(source_path)
-        preview_size = self.current_preview_nominal_size()
-        frames = frames_from_source_metadata(metadata, preview_size)
-        if not frames:
-            self.source_preview_panel.clear("No extracted frames available")
-            return
-        images = [self.preview_photo(Path(frame["png"]), PLAYER_PREVIEW_SIZE) for frame in frames]
-        inspection = inspect_animation_behavior(frames)
-        summary = (
-            f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))} total | "
-            f"using build-consistent native entries for {preview_size}px"
-        )
-        frame_info = f"Actual source timing preserved. First frame nominal size: {frames[0]['nominal_size']}px."
-        self.source_preview_panel.set_frames(
-            frames,
-            images,
-            summary,
-            frame_info,
-            inspection_text=f"{inspection['stats']} | {inspection['timeline']}",
-            warning_text="; ".join(inspection["warnings"][:2]),
-        )
+        token = self.request_tracker.next("selected-detail")
+        preview_root = self.current_preview_root()
+        preview_nominal_size = self.current_preview_nominal_size()
+        target_sizes = self.try_target_sizes()[0]
+        scale_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
+        source_path = Path(path)
 
-    def _load_output_preview(self, source_path: Path) -> None:
-        preview_size = self.current_preview_nominal_size()
-        preview = self.ensure_output_preview(source_path, preview_size)
-        frames = preview["frames"]
-        images = [self.preview_photo(Path(frame["png"]), PLAYER_PREVIEW_SIZE) for frame in frames]
-        inspection = inspect_animation_behavior(frames)
-        total_ms = sum(int(frame.get("delay_ms", 50)) for frame in frames)
-        if frames:
-            first = frames[0]
-            frame_info = (
-                f"Nominal size {preview['preview_nominal_size']}px | emitted PNG {first['width']}x{first['height']} | "
-                f"filter {preview['scale_filter']}"
+        self.source_preview_panel.set_loading("Preparing source preview...")
+        self.output_preview_panel.set_loading("Preparing Linux output preview...")
+
+        def source_work(
+            source_path: Path = source_path,
+            preview_root: Path = preview_root,
+            preview_nominal_size: int = preview_nominal_size,
+        ) -> dict:
+            return prepare_source_preview_payload(
+                source_path,
+                preview_root,
+                preview_nominal_size,
+                self.source_metadata_cache,
             )
-        else:
-            frame_info = "No predicted frames available"
-        summary = f"{len(frames)} frame(s) | {format_duration_ms(total_ms)} total | built path preview"
-        self.output_preview_panel.set_frames(
-            frames,
+
+        def source_success(result_token: TaskToken, payload: dict, *, source_path: str = path) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            if self._selected_slot_path() != source_path:
+                return
+            self._apply_preview_panel_payload(self.source_preview_panel, payload)
+
+        def source_error(result_token: TaskToken, exc: BaseException, *, source_path: str = path) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            if self._selected_slot_path() != source_path:
+                return
+            self.source_preview_panel.clear(str(exc))
+
+        self.task_runner.submit(token, source_work, on_success=source_success, on_error=source_error)
+
+        def output_work(
+            source_path: Path = source_path,
+            preview_root: Path = preview_root,
+            preview_nominal_size: int = preview_nominal_size,
+            target_sizes: list[int] = list(target_sizes),
+            scale_filter: str = scale_filter,
+        ) -> dict:
+            return prepare_output_preview_payload(
+                source_path,
+                preview_root,
+                preview_nominal_size,
+                target_sizes,
+                scale_filter,
+                self.source_metadata_cache,
+                self.output_preview_cache,
+            )
+
+        def output_success(result_token: TaskToken, payload: dict, *, source_path: str = path) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            if self._selected_slot_path() != source_path:
+                return
+            self._apply_preview_panel_payload(self.output_preview_panel, payload)
+
+        def output_error(result_token: TaskToken, exc: BaseException, *, source_path: str = path) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            if self._selected_slot_path() != source_path:
+                return
+            self.output_preview_panel.clear(str(exc))
+
+        self.task_runner.submit(token, output_work, on_success=output_success, on_error=output_error)
+
+    def _render_selected_slot_text(self) -> None:
+        slot = SLOT_BY_KEY[self.selected_slot_key]
+        path = self._selected_slot_path()
+        self.selected_slot_title_var.set(slot["label"])
+        if not path:
+            self.selected_slot_meta_var.set("No source selected yet.")
+            self.selected_slot_path_var.set("Use Auto-Fill, Browse Source, or choose a ranked candidate.")
+            set_readonly_text(self.slot_warning_text, "This slot is currently unassigned.")
+            return
+
+        self.selected_slot_path_var.set(compact_path(path, max_len=130))
+        state = self.slot_states[self.selected_slot_key]
+        if state.path != path or state.loading:
+            self.selected_slot_meta_var.set("Loading source metadata and quality forecast...")
+            set_readonly_text(self.slot_warning_text, "- Preparing source metadata and quality forecast...")
+            return
+        if state.error:
+            self.selected_slot_meta_var.set("Unable to inspect the selected source.")
+            set_readonly_text(self.slot_warning_text, f"- {state.error}")
+            return
+        if state.summary is None or state.quality is None:
+            self.selected_slot_meta_var.set("Loading source metadata and quality forecast...")
+            set_readonly_text(self.slot_warning_text, "- Preparing source metadata and quality forecast...")
+            return
+
+        quality = state.quality
+        summary = state.summary
+        self.selected_slot_meta_var.set(
+            f"{badges_for_summary(summary)} | Quality: {quality['label']} ({quality.get('confidence', 'low')} confidence) | "
+            f"{quality['decision']}"
+        )
+        set_readonly_text(self.slot_warning_text, self._slot_guidance_text(self.selected_slot_key, summary, quality))
+
+    def _apply_preview_panel_payload(self, panel: AnimationPreviewPanel, payload: dict) -> None:
+        preview = payload.get("preview")
+        if preview is None:
+            panel.clear(payload.get("reason", "No preview available"))
+            return
+        if not preview.get("frames"):
+            panel.clear(payload.get("reason", "No preview available"))
+            return
+        images = [
+            self.preview_photo_from_path(Path(preview_path), panel.canvas_size)
+            for preview_path in preview["thumbnail_paths"]
+        ]
+        panel.set_frames(
+            preview["frames"],
             images,
-            summary,
-            frame_info,
-            inspection_text=f"{inspection['stats']} | {inspection['timeline']}",
-            warning_text="; ".join(inspection["warnings"][:2]),
+            preview["summary"],
+            preview["frame_info"],
+            inspection_text=preview["inspection_text"],
+            warning_text=preview["warning_text"],
         )
 
     def _populate_candidate_tree(self) -> None:
@@ -2093,7 +4460,7 @@ class MappingApp:
                     ("ANI" if candidate["is_animated"] else "Static"),
                     candidate["size_summary"],
                     candidate["score"],
-                    candidate["reason"],
+                    self._candidate_reason_for_tree(self.selected_slot_key, candidate),
                 ),
             )
         current_path = self._selected_slot_path()
@@ -2113,53 +4480,132 @@ class MappingApp:
     def _refresh_candidate_detail(self) -> None:
         selection = self.candidate_tree.selection()
         if not selection or selection[0] == "__none__":
+            self.request_tracker.invalidate("candidate-preview")
             self.selected_candidate_path = None
-            self.candidate_summary_var.set("Select a candidate to inspect it.")
-            self.candidate_warning_var.set("")
+            set_readonly_text(self.candidate_reason_text, "Select a candidate to inspect its ranking logic.")
+            current_path = self._selected_slot_path()
+            if current_path:
+                quality = self._slot_quality(self.selected_slot_key, current_path) or {
+                    "label": "--",
+                    "confidence": "low",
+                    "decision": "review",
+                    "reason": "No quality data yet.",
+                }
+                set_readonly_text(
+                    self.current_choice_text,
+                    self._current_choice_text(self.selected_slot_key, current_path, quality, None),
+                )
+            else:
+                set_readonly_text(self.current_choice_text, "Auto-fill or assign a slot to explain the active choice.")
             self.candidate_preview_panel.clear("No candidate selected")
+            self._refresh_compare_view()
             return
         candidate_path = selection[0]
         self.selected_candidate_path = candidate_path
-        try:
-            candidate = self._candidate_lookup().get(candidate_path, {})
-            summary = self.ensure_summary(Path(candidate_path))
-            quality = self._slot_quality(self.selected_slot_key, candidate_path)
-            reason = candidate.get("reason", "Manual source selection")
-            rank = candidate.get("rank")
-            rank_text = f"Rank #{rank}" if rank is not None else "Manual source"
-            relative_path = summary.get("relative_path", compact_path(candidate_path, max_len=82))
-            self.candidate_summary_var.set(
-                f"{Path(candidate_path).name} | {rank_text} for {SLOT_BY_KEY[self.selected_slot_key]['label']}\n"
-                f"{badges_for_summary(summary)} | quality {quality['label']}\n"
-                f"Reason: {reason}\n"
-                f"Source location: {relative_path}"
+        set_readonly_text(self.candidate_reason_text, "Preparing candidate metadata and ranking explanation...")
+        set_readonly_text(self.current_choice_text, "Preparing current-choice provenance...")
+        self.candidate_preview_panel.set_loading("Loading candidate preview...")
+        token = self.request_tracker.next("candidate-preview")
+        candidate = self._candidate_lookup().get(candidate_path, {})
+        preview_root = self.current_preview_root()
+        preview_nominal_size = self.current_preview_nominal_size()
+        target_sizes = self.try_target_sizes()[0]
+        slot_key = self.selected_slot_key
+        asset_summary = self.pack_asset_lookup.get(candidate_path)
+        ambiguous_candidates = self._ambiguous_candidates_for_slot(slot_key)
+        pack_analysis = self.pack_analysis
+
+        def work(
+            candidate_path: str = candidate_path,
+            preview_root: Path = preview_root,
+            preview_nominal_size: int = preview_nominal_size,
+            target_sizes: list[int] = list(target_sizes),
+            slot_key: str = slot_key,
+            asset_summary: dict | None = asset_summary,
+            ambiguous_candidates: list[dict] = list(ambiguous_candidates),
+            pack_analysis: dict | None = pack_analysis,
+        ) -> dict:
+            return prepare_candidate_preview_payload(
+                Path(candidate_path),
+                preview_root,
+                preview_nominal_size,
+                target_sizes,
+                slot_key,
+                self.source_metadata_cache,
+                self.summary_cache,
+                pack_analysis=pack_analysis,
+                asset_summary=asset_summary,
+                ambiguous_candidates=ambiguous_candidates,
             )
-            warning_lines = []
-            warning_lines.extend(candidate.get("warnings", []))
-            if candidate.get("low_priority_hits"):
-                warning_lines.append("stored under a lower-priority/generated folder")
-            if candidate.get("depth", 0):
-                warning_lines.append(f"nested {candidate['depth']} folder level(s) below the pack root")
-            warning_lines.extend(quality["warnings"])
-            self.candidate_warning_var.set(
-                "; ".join(list(dict.fromkeys(warning_lines))[:4]) or "No immediate candidate warnings."
+
+        def on_success(
+            result_token: TaskToken,
+            payload: dict,
+            *,
+            candidate_path: str = candidate_path,
+            slot_key: str = slot_key,
+            candidate: dict = dict(candidate),
+        ) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            if self.selected_slot_key != slot_key:
+                return
+            selection = self.candidate_tree.selection()
+            if not selection or selection[0] != candidate_path:
+                return
+            summary = payload["summary"]
+            quality = payload["quality"]
+            current_path = self._selected_slot_path()
+            current_quality = self._slot_quality(slot_key, current_path) if current_path else None
+            if current_quality is None and current_path:
+                current_quality = {
+                    "label": "--",
+                    "confidence": "low",
+                    "decision": "review",
+                    "reason": "Quality data is still loading.",
+                }
+            set_readonly_text(
+                self.candidate_reason_text,
+                self._candidate_explanation_text(slot_key, candidate or {"path": candidate_path}, summary, quality),
             )
-            metadata = self.ensure_source_metadata(Path(candidate_path))
-            frames = frames_from_source_metadata(metadata, self.current_preview_nominal_size())
-            images = [self.preview_photo(Path(frame["png"]), CANDIDATE_PREVIEW_SIZE) for frame in frames]
-            inspection = inspect_animation_behavior(frames)
-            self.candidate_preview_panel.set_frames(
-                frames,
-                images,
-                f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))}",
-                f"Candidate path: {compact_path(candidate_path, max_len=82)}",
-                inspection_text=f"{inspection['stats']} | {inspection['timeline']}",
-                warning_text="; ".join(inspection["warnings"][:2]),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.candidate_summary_var.set(Path(candidate_path).name)
-            self.candidate_warning_var.set(str(exc))
+            if current_path and current_quality is not None:
+                set_readonly_text(
+                    self.current_choice_text,
+                    self._current_choice_text(slot_key, current_path, current_quality, candidate),
+                )
+            else:
+                set_readonly_text(self.current_choice_text, "Assign the slot first to compare the active choice against this candidate.")
+            self._apply_preview_panel_payload(self.candidate_preview_panel, payload)
+            self._refresh_compare_view()
+
+        def on_error(
+            result_token: TaskToken,
+            exc: BaseException,
+            *,
+            candidate_path: str = candidate_path,
+            slot_key: str = slot_key,
+        ) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            if self.selected_slot_key != slot_key:
+                return
+            selection = self.candidate_tree.selection()
+            if not selection or selection[0] != candidate_path:
+                return
+            set_readonly_text(self.candidate_reason_text, f"- Unable to inspect {Path(candidate_path).name}\n- {exc}")
+            current_path = self._selected_slot_path()
+            current_quality = self._slot_quality(slot_key, current_path) if current_path else None
+            if current_path and current_quality is not None:
+                set_readonly_text(
+                    self.current_choice_text,
+                    self._current_choice_text(slot_key, current_path, current_quality, candidate),
+                )
+            else:
+                set_readonly_text(self.current_choice_text, "Current-choice provenance is unavailable right now.")
             self.candidate_preview_panel.clear(str(exc))
+            self._refresh_compare_view()
+
+        self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
 
     def _refresh_build_summary(self) -> None:
         sizes, size_error = self.try_target_sizes()
@@ -2174,20 +4620,34 @@ class MappingApp:
 
         quality_labels = []
         warning_lines = []
+        pending_slots = []
+        quality_entries: list[tuple[dict, dict]] = []
         for slot in SLOT_DEFS:
             path = self.slot_paths.get(slot["key"], "").strip()
             if not path:
                 continue
-            quality = self._slot_quality(slot["key"], path)
-            if quality is None:
+            state = self.slot_states[slot["key"]]
+            if state.path != path or state.loading:
+                pending_slots.append(slot["label"])
                 continue
+            if state.error:
+                quality_labels.append("redraw recommended")
+                warning_lines.append(f"- {slot['label']}: {state.error}")
+                continue
+            quality = state.quality
+            if quality is None:
+                pending_slots.append(slot["label"])
+                continue
+            quality_entries.append((slot, quality))
             quality_labels.append(quality["label"])
-            for warning in quality["warnings"][:2]:
+            for warning in quality.get("warnings", [])[:2]:
                 warning_lines.append(f"- {slot['label']}: {warning}")
 
         if mapping_error:
             self.overall_quality_var.set("Overall quality forecast: configuration error")
             warning_lines.insert(0, f"- Mapping error: {mapping_error}")
+        elif not quality_labels and pending_slots:
+            self.overall_quality_var.set(f"Overall quality forecast: loading slot analysis ({len(pending_slots)} pending)")
         elif not quality_labels:
             self.overall_quality_var.set("Overall quality forecast: no source slots assigned")
         else:
@@ -2202,17 +4662,76 @@ class MappingApp:
                 overall = "likely blurry"
             else:
                 overall = "redraw recommended"
+            low_confidence_count = sum(1 for _slot, quality in quality_entries if quality.get("confidence") == "low")
+            confidence = "low" if low_confidence_count >= max(1, len(quality_entries) // 3) else "medium"
+            if low_confidence_count == 0 and quality_entries and all(
+                quality.get("confidence") == "high" for _slot, quality in quality_entries
+            ):
+                confidence = "high"
+            suffix = f" | {len(pending_slots)} slot(s) still preparing" if pending_slots else ""
             self.overall_quality_var.set(
-                f"Overall quality forecast: {overall} | {len(selected_slots)} slot(s) assigned | {len(resolved)} Linux roles resolved"
+                f"Overall quality forecast: {overall} ({confidence} confidence) | "
+                f"{len(selected_slots)} slot(s) assigned | {len(resolved)} Linux roles resolved{suffix}"
             )
+
+        at_risk = [
+            (slot, quality)
+            for slot, quality in quality_entries
+            if quality["label"] in LOW_CONFIDENCE_LABELS or quality.get("confidence") == "low"
+        ]
+        redraw_queue = [
+            (slot, quality)
+            for slot, quality in quality_entries
+            if quality["label"] == "redraw recommended"
+        ]
+        suggested_preset = None
+        for _slot, quality in quality_entries:
+            if quality.get("suggested_preset"):
+                suggested_preset = quality["suggested_preset"]
+                break
+        if suggested_preset is None and self.pack_analysis is not None:
+            hidpi = self.pack_analysis.get("hidpi_potential", {})
+            if max(sizes or [0]) >= 96 and hidpi.get("rating") in {"weak", "limited"}:
+                suggested_preset = SAFE_PRESET_LABEL
 
         if size_error:
             warning_lines.insert(0, f"- Output sizes: {size_error}")
+        if pending_slots:
+            pending_preview = ", ".join(pending_slots[:4])
+            if len(pending_slots) > 4:
+                pending_preview += ", ..."
+            warning_lines.insert(0, f"- Preparing quality data for: {pending_preview}")
         if self.pack_analysis is not None:
             for warning in self.pack_analysis.get("warnings", []):
                 warning_lines.append(f"- Pack: {warning}")
 
-        set_readonly_text(self.build_warning_text, "\n".join(dict.fromkeys(warning_lines)) or "No major warnings.")
+        guidance_lines = []
+        if suggested_preset:
+            guidance_lines.extend(
+                [
+                    "Preset guidance:",
+                    f"- {suggested_preset} is the safer baseline if you want less upscale-heavy output.",
+                    "",
+                ]
+            )
+        if at_risk:
+            guidance_lines.append("Slots to review before export:")
+            for slot, quality in at_risk[:8]:
+                guidance_lines.append(
+                    f"- {slot['label']}: {quality['label']} ({quality.get('confidence', 'low')} confidence) | {quality['decision']}"
+                )
+            guidance_lines.append("")
+        if redraw_queue:
+            guidance_lines.append("Manual replacement / redraw queue:")
+            for slot, quality in redraw_queue[:6]:
+                action = quality.get("actions", ["Manual replacement recommended."])[0]
+                guidance_lines.append(f"- {slot['label']}: {action}")
+            guidance_lines.append("")
+        if warning_lines:
+            guidance_lines.append("Warnings:")
+            guidance_lines.extend(dict.fromkeys(warning_lines))
+
+        set_readonly_text(self.build_warning_text, "\n".join(guidance_lines) or "No major warnings.")
 
         try:
             preset = resolve_build_preset(self.build_preset_var.get().strip())
@@ -2226,9 +4745,10 @@ class MappingApp:
             f"Output root: {self.work_root_var.get().strip() or DEFAULT_WORK_ROOT}",
             f"Target sizes: {format_cursor_sizes(sizes)}",
             f"Scale filter: {self.scale_filter_var.get()}",
-            "",
-            "Selected slots:",
         ]
+        if suggested_preset:
+            build_summary_lines.append(f"Suggested safer preset: {suggested_preset}")
+        build_summary_lines.extend(["", "Selected slots:"])
         if selected_slots:
             for item in sorted(selected_slots.values(), key=lambda item: item["slot"]["label"]):
                 build_summary_lines.append(f"- {item['slot']['label']}: {item['path']}")
@@ -2257,6 +4777,21 @@ class MappingApp:
         except Exception as exc:  # noqa: BLE001
             self.summary_var.set(str(exc))
 
+    def _on_target_sizes_changed(self) -> None:
+        if self._suspend_refresh_traces:
+            return
+        self.on_build_settings_changed()
+
+    def _on_scale_filter_changed(self) -> None:
+        if self._suspend_refresh_traces:
+            return
+        self.on_build_settings_changed()
+
+    def _on_preview_size_changed(self) -> None:
+        if self._suspend_refresh_traces:
+            return
+        self._refresh_selected_slot_detail()
+
     def on_build_settings_changed(self) -> None:
         self._update_preview_size_choices()
         self.output_preview_cache.clear()
@@ -2264,11 +4799,15 @@ class MappingApp:
 
     def apply_selected_preset(self) -> None:
         preset = resolve_build_preset(self.build_preset_var.get())
-        self.target_sizes_var.set(format_cursor_sizes(preset["target_sizes"]))
-        self.scale_filter_var.set(preset["scale_filter"])
-        self.build_preset_var.set(preset["label"])
-        self.preset_description_var.set(describe_build_preset(preset["label"]))
-        self.preview_nominal_size_var.set(str(self._default_preview_size(preset["target_sizes"])))
+        self._suspend_refresh_traces = True
+        try:
+            self.target_sizes_var.set(format_cursor_sizes(preset["target_sizes"]))
+            self.scale_filter_var.set(preset["scale_filter"])
+            self.build_preset_var.set(preset["label"])
+            self.preset_description_var.set(describe_build_preset(preset["label"]))
+            self.preview_nominal_size_var.set(str(self._default_preview_size(preset["target_sizes"])))
+        finally:
+            self._suspend_refresh_traces = False
         self.set_status(f"Applied preset: {preset['label']}")
         self._refresh_all_views()
 
@@ -2301,7 +4840,14 @@ class MappingApp:
             return
         work_root.mkdir(parents=True, exist_ok=True)
 
-        payload = build_payload(selected_slots, resolved, target_sizes, self.scale_filter_var.get())
+        payload = build_payload(
+            selected_slots,
+            resolved,
+            target_sizes,
+            self.scale_filter_var.get(),
+            selection_context=self._selection_context_payload(),
+        )
+        scale_filter = self.scale_filter_var.get()
         build_root = work_root / "_builds" / safe_theme_name
         mapping_store_dir = work_root / "_mappings"
         mapping_path = mapping_store_dir / f"{safe_theme_name}.json"
@@ -2317,35 +4863,46 @@ class MappingApp:
             ):
                 return
 
-        try:
-            self.set_status(f"Saving mapping for {safe_theme_name}")
+        self._set_build_busy(True, f"Building Linux cursor theme: {safe_theme_name}")
+        token = self.request_tracker.next("build-and-package")
+
+        def work() -> dict:
             if build_root.exists():
                 shutil.rmtree(build_root)
             build_root.mkdir(parents=True, exist_ok=True)
             mapping_store_dir.mkdir(parents=True, exist_ok=True)
             mapping_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            self.current_mapping_path = mapping_path
-
-            self.set_status(f"Building Linux cursor theme: {safe_theme_name}")
             manifest = build_theme_from_mapping(
                 mapping_path,
                 build_root,
                 safe_theme_name,
                 target_sizes,
-                scale_filter=self.scale_filter_var.get(),
+                scale_filter=scale_filter,
             )
             built_theme_dir = Path(manifest["theme_dir"]).resolve()
 
-            self.set_status(f"Copying final theme to {final_theme_dir}")
             if final_theme_dir.exists():
                 shutil.rmtree(final_theme_dir)
             shutil.copytree(built_theme_dir, final_theme_dir)
 
-            self.set_status(f"Packaging tarball: {tar_path.name}")
             if tar_path.exists():
                 tar_path.unlink()
             package_theme(final_theme_dir, tar_path)
 
+            return {
+                "mapping_path": str(mapping_path.resolve()),
+                "final_theme_dir": str(final_theme_dir.resolve()),
+                "tar_path": str(tar_path.resolve()),
+            }
+
+        def on_success(result_token: TaskToken, result: dict) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            self._set_build_busy(False)
+            final_theme_dir = Path(result["final_theme_dir"])
+            tar_path = Path(result["tar_path"])
+            mapping_path = Path(result["mapping_path"])
+            self.current_mapping_path = mapping_path
             self.last_theme_dir = final_theme_dir
             self.last_tar_path = tar_path
             self.last_output_var.set(
@@ -2357,9 +4914,14 @@ class MappingApp:
                 "Build Complete",
                 f"Theme directory:\n{final_theme_dir}\n\nTarball:\n{tar_path}\n\nMapping JSON:\n{mapping_path}",
             )
-        except Exception as exc:  # noqa: BLE001
-            self.set_status("Build failed")
+
+        def on_error(result_token: TaskToken, exc: BaseException) -> None:
+            if not self.request_tracker.is_current(result_token):
+                return
+            self._set_build_busy(False, "Build failed")
             messagebox.showerror("Build failed", str(exc))
+
+        self.task_runner.submit(token, work, on_success=on_success, on_error=on_error)
 
 
 def main(argv: list[str] | None = None) -> None:

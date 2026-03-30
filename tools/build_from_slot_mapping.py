@@ -31,6 +31,14 @@ from slot_definitions import (
     SCALE_FILTER_CHOICES,
     normalize_cursor_sizes,
 )
+from preview_cache import (
+    MAX_OUTPUT_PREVIEW_DIRS,
+    MAX_SOURCE_CACHE_DIRS,
+    cache_artifact_dir,
+    prune_cache_dir,
+    source_cache_identity,
+    touch_cache_path,
+)
 from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
@@ -38,11 +46,7 @@ MAPPING_FORMAT_VERSION = 2
 
 
 def unique_extract_dir(base: Path, source_path: Path) -> Path:
-    resolved_source = source_path.expanduser().resolve()
-    digest = hashlib.sha256(
-        f"{resolved_source}::{file_cache_token(resolved_source)}".encode("utf-8")
-    ).hexdigest()[:10]
-    return base / f"{sanitize_path_component(resolved_source.stem)}-{digest}"
+    return cache_artifact_dir(base, source_path)
 
 
 def parse_size_list(raw_sizes: str | list[int] | None) -> list[int]:
@@ -273,6 +277,8 @@ def prepare_output_preview_metadata(
     *,
     scale_filter: str | None = None,
     preview_nominal_size: int | None = None,
+    source_metadata: dict | None = None,
+    source_cache_root: Path | None = None,
 ) -> dict:
     source_path = source_path.expanduser().resolve()
     preview_root = preview_root.expanduser().resolve()
@@ -284,8 +290,12 @@ def prepare_output_preview_metadata(
         choices = ", ".join(SCALE_FILTER_CHOICES)
         raise ValueError(f"unsupported scale filter {filter_name!r}; expected one of: {choices}")
 
+    source_cache_root = (source_cache_root or preview_root.parent / "_source").expanduser().resolve()
     asset_work_dir = unique_extract_dir(preview_root, source_path)
-    metadata = load_source_metadata(source_path, preview_root / "_source")
+    metadata = source_metadata if source_metadata is not None else load_source_metadata(source_path, source_cache_root)
+    if source_path.suffix.lower() not in {".json", ".png"}:
+        touch_cache_path(unique_extract_dir(source_cache_root, source_path))
+        prune_cache_dir(source_cache_root, MAX_SOURCE_CACHE_DIRS)
     prepared = prepare_scaled_frames(
         metadata,
         sizes,
@@ -309,6 +319,9 @@ def prepare_output_preview_metadata(
     ]
     if not preview_frames:
         raise ValueError(f"no prepared frames available for preview size {selected_nominal_size}")
+
+    touch_cache_path(asset_work_dir)
+    prune_cache_dir(preview_root, MAX_OUTPUT_PREVIEW_DIRS)
 
     return {
         "source": localized.get("source"),
@@ -363,7 +376,7 @@ def build_theme_from_mapping(
         if not source_path.exists():
             raise FileNotFoundError(f"source file for role {role_name!r} does not exist: {source_path}")
 
-        cache_key = str(source_path)
+        cache_key = source_cache_identity(source_path)
         if cache_key not in asset_cache:
             asset_work_dir = unique_extract_dir(extracted_dir, source_path)
             metadata = load_source_metadata(source_path, extracted_dir)

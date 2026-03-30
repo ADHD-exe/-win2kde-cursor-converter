@@ -21,8 +21,8 @@ from slot_definitions import (
     SLOT_BY_KEY,
     SLOT_DEFS,
     WINDOWS_ROLE_TO_SLOT,
+    explain_slot_match,
     normalize_cursor_sizes,
-    score_slot_match,
 )
 from windows_cursor_tool import inspect_path
 
@@ -142,7 +142,8 @@ def heuristic_slot_candidates(source_dir: Path, cursor_files: list[Path]) -> dic
 
     for path in cursor_files:
         for slot in SLOT_DEFS:
-            score = score_slot_match(path.stem, slot)
+            match_details = explain_slot_match(path.stem, slot)
+            score = int(match_details["score"])
             if score <= 0:
                 continue
             candidates[slot["key"]].append(
@@ -150,6 +151,8 @@ def heuristic_slot_candidates(source_dir: Path, cursor_files: list[Path]) -> dic
                     "path": path.resolve(),
                     "score": score,
                     "reason": f"filename heuristic matched {slot['label']}",
+                    "match_details": match_details,
+                    "provenance": "heuristic",
                 }
             )
 
@@ -337,13 +340,18 @@ def enrich_slot_candidates(
                     "filename": asset["filename"],
                     "score": candidate["score"],
                     "reason": candidate["reason"],
+                    "match_details": candidate.get("match_details", {}),
+                    "provenance": candidate.get("provenance", "heuristic"),
                     "is_animated": asset["is_animated"],
                     "source_type": asset["source_type"],
                     "size_summary": asset["size_summary"],
                     "largest_native_size": asset["largest_native_size"],
+                    "largest_native_area": asset.get("largest_native_area", 0),
+                    "native_sizes": list(asset.get("native_sizes", [])),
                     "warnings": list(asset.get("warnings", [])),
                     "low_priority_hits": low_priority,
                     "depth": depth,
+                    "duplicate_basename_count": asset.get("duplicate_basename_count", 0),
                 }
             )
         enriched[slot_key] = enriched_list
@@ -462,6 +470,7 @@ def analyze_cursor_pack(source_dir: Path, cursor_files: list[Path] | None = None
             "total": len(discovered_files),
         },
         "install_inf": inf_details,
+        "install_inf_mapping": {slot_key: str(path) for slot_key, path in inf_mapping.items()},
         "install_inf_slots_resolved": len(inf_mapping),
         "animated_sources": animated_sources,
         "largest_native_sizes_found": size_values[:10],

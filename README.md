@@ -28,12 +28,14 @@ The project now has both:
 Recent product-level upgrades:
 - pack analysis before slot mapping
 - at-a-glance analysis snapshot cards for source count, animation coverage, HiDPI potential, and attention items
+- actionable analysis queue with jump-to-review, compare, and preset guidance
 - visual slot cards instead of a raw path table
 - real animated source previews
 - predicted Linux output previews driven by current build settings
-- ranked candidate browser per slot
+- ranked candidate browser per slot with current-choice provenance and ranking explanations
+- compare workspace for source/output, current/alternate candidate, and preset-to-preset checks
 - named build presets
-- quality forecast and validation warnings
+- richer quality forecast, confidence, and redraw guidance
 
 ## Dependencies
 
@@ -61,16 +63,25 @@ Required tools:
 From the repo root:
 
 ```bash
-python ./cursor-source-slot-mapper.py
+python ./cursorforge.py
 ```
 
 You can also use:
 
 ```bash
-python ./win2kde-cursor-converter.py
+python ./cursorforge-gui.py
 ```
 
 ## GUI Workflow
+
+The GUI now keeps long-running analysis, preview preparation, and build/export work off the Tk main thread.
+Instead of freezing during extraction or preview generation, the relevant panels show loading states such as:
+- `Analyzing pack...`
+- `Preparing source preview...`
+- `Preparing Linux output preview...`
+- `Loading candidate preview...`
+
+If you change the selected slot, preview size, scale filter, source pack, or work root while a background job is still running, older results are discarded so they cannot overwrite the current view.
 
 ### Stage 1: Source Pack Analysis
 
@@ -86,11 +97,17 @@ The GUI now surfaces pack-level diagnostics before mapping:
 - ambiguous slot candidates
 - low-quality pack warnings
 
+The analysis stage now turns those warnings into actions:
+- `Open Target` jumps into the relevant slot or build stage
+- `Open Compare` goes straight into compare mode when a visual decision is needed
+- `Apply Suggested Preset` lets weak HiDPI packs fall back to a safer preset immediately
+- double-clicking an asset in the source list opens the closest slot/candidate context when one exists
+
 The analysis stage also includes snapshot cards so users can judge pack quality quickly before they start correcting slots:
 - total source file count
 - animated source coverage
 - HiDPI rating
-- combined attention signals from warnings, ambiguity, and duplicate artifacts
+- combined attention signals and action-item count
 
 Click `Auto-Fill From Pack` to run the prepare step and populate the slot review stage using the same analyzed source data.
 
@@ -113,16 +130,25 @@ Each slot card shows:
 
 Selecting a slot opens a richer review panel with:
 - selected source details
-- validation warnings
+- validation warnings, confidence, and next-step guidance
+- current-choice provenance so users can see whether the slot came from `install.inf`, heuristic ranking, fallback reuse, or manual override
 - true source animation preview using real frame order and `delay_ms`
 - predicted Linux output preview using the current build settings
 - ranked candidate browser for that slot
-- candidate preview and ranking explanation
+- candidate preview, ranking explanation, and why lower-ranked options lost
+
+The review stage now also includes a dedicated compare workspace with three modes:
+- `Current vs Candidate`
+- `Source vs Linux Output`
+- `Current Build vs Compare Preset`
+
+This makes it possible to compare the assigned cursor against an alternate candidate, inspect how conversion changes the motion/output, or judge whether a smaller preset is safer than a large HiDPI build.
 
 Manual correction still works through:
 - `Browse Source`
 - `Clear Slot`
 - `Use Selected Candidate`
+- `Open Compare`
 
 Manual `.json` and `.png` sources remain supported.
 
@@ -159,16 +185,24 @@ Two preview paths are shown:
 - `Predicted Linux Output Preview`
   This runs the current builder path with the selected sizes and scale filter, then previews the expected emitted Linux cursor frames.
 
+Preview cache behavior:
+- preview cache files live under `<work-root>/_preview-cache`
+- source metadata and predicted-output preview keys include the selected source path, the active work root, and the current preview settings
+- manual `.json` sources also include the referenced PNG dependency tokens, so editing a PNG refreshes both source and predicted-output previews even when the JSON file itself does not change
+- in-memory preview caches are bounded, and older on-disk preview artifacts are pruned gradually during long GUI sessions
+
 The preview panels include:
 - play
 - pause
 - replay
+- previous/next frame stepping
 - speed multiplier
 - frame count
 - duration summary
 - timing profile summary
-- compact frame-strip timing readout
+- per-frame strip with start time, delay, size, hotspot, and timing note
 - warnings for suspicious animation behavior such as very short loops, sharp timing jumps, or non-square frames
+- loop-shape checks for size jitter or moving hotspots
 
 Static assets still preview correctly.
 
@@ -206,7 +240,24 @@ Quality forecast labels:
 - `likely blurry`
 - `redraw recommended`
 
-The forecast is based on native source detail relative to the current requested output sizes.
+The forecast is now paired with a confidence hint and decision guidance such as:
+- build-ready
+- build-ready with review
+- compare before export
+- reduce preset or replace art
+- manual replacement required
+
+The forecast still stays heuristic, but it now considers:
+- native detail versus requested output ceiling
+- native size coverage across the requested size list
+- ambiguous slot ranking
+- generated-folder / duplicate-source risk
+- non-square source behavior
+
+The build stage also highlights:
+- slots that should be reviewed before export
+- a redraw/manual replacement queue
+- a safer preset suggestion when large output sizes are likely to blur badly
 
 ## Output
 
@@ -322,6 +373,7 @@ Legacy flat JSON frame metadata is still accepted.
 Manual metadata JSON validation remains strict:
 - `frames` must be a list
 - `entries[]` must not be empty
+- referenced PNG changes invalidate preview metadata and preview output caches automatically
 - referenced PNG files must exist
 - provided width and height must match the actual PNG dimensions
 - hotspots must be within the PNG bounds
@@ -330,4 +382,5 @@ Manual metadata JSON validation remains strict:
 
 - generic conversion stays theme-agnostic by default
 - the GUI now helps users analyze and correct weak packs earlier instead of waiting until after build
+- compare mode and actionable warnings are meant to reduce “score guessing” during review
 - some Windows packs still need manual slot correction if filenames or `install.inf` metadata are ambiguous
